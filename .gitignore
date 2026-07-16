@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+omniui_env/
+.pytest_cache/
+
+# Env
+.env
+
+# Runtime data (don't ship user uploads/outputs in version control)
+storage/uploads/*
+storage/jobs/*
+storage/outputs/*
+!storage/uploads/.gitkeep
+!storage/jobs/.gitkeep
+!storage/outputs/.gitkeep
+
+models_cache/*
+!models_cache/.gitkeep
+
+# Editors
+.vscode/
+.idea/

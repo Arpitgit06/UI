@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OmniUI — Local Video-to-Code AI Pipeline</title>
+  <meta name="description" content="100% offline, GPU-accelerated local pipeline converting UI video recordings into exact working React, HTML, CSS, and Three.js code." />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-background">
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+  </div>
+
+  <header class="navbar">
+    <div class="nav-container">
+      <div class="brand">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M2 17L12 22L22 17" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M2 12L12 17L22 12" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <defs>
+              <linearGradient id="logo-grad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#00f2fe"/>
+                <stop offset="1" stop-color="#4facfe"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">OmniUI</h1>
+          <p class="brand-subtitle">Offline Video-to-UI Code Generation Architecture</p>
+        </div>
+      </div>
+      <div class="nav-actions">
+        <div class="status-pill" id="systemStatusPill">
+          <span class="status-dot"></span>
+          <span id="systemStatusText">Connecting to local GPU...</span>
+        </div>
+        <a href="/docs" target="_blank" class="btn-secondary btn-sm">API Docs (Swagger)</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-container">
+    <!-- Section 1: System Health & VRAM Monitor -->
+    <section class="metrics-grid">
+      <div class="metric-card glass">
+        <div class="metric-header">
+          <span class="metric-label">GPU Acceleration & VRAM</span>
+          <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4m-2-2v4m8-2h.01M16 12h.01"/></svg>
+        </div>
+        <div class="metric-value" id="gpuNameDisplay">Checking GPU...</div>
+        <div class="metric-sub" id="vramUsageDisplay">VRAM: Calculating...</div>
+      </div>
+
+      <div class="metric-card glass">
+        <div class="metric-header">
+          <span class="metric-label">Job Queue & Active Tasks</span>
+          <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <div class="metric-value" id="queueSizeDisplay">0 Pending</div>
+        <div class="metric-sub" id="activeJobDisplay">Active: None</div>
+      </div>
+
+      <div class="metric-card glass">
+        <div class="metric-header">
+          <span class="metric-label">Local LLM Syntax Compiler</span>
+          <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>
+        </div>
+        <div class="metric-value" id="llmModelDisplay">Local LLM (Checking...)</div>
+        <div class="metric-sub" id="llmTargetDisplay">Model: Loading...</div>
+      </div>
+    </section>
+
+    <!-- Section 2: Video Ingest Dropzone -->
+    <section class="upload-section glass" id="uploadSection">
+      <div class="section-heading">
+        <h2>1. Ingest UI Video Recording</h2>
+        <p>Upload a 2D or 3D screen recording (.mp4, .webm, .mkv) of your UI design or interaction concept.</p>
+      </div>
+
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="videoFileInput" accept="video/mp4,video/webm,video/x-matroska" hidden />
+        <div class="dropzone-content" id="dropzoneDefault">
+          <div class="drop-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+          </div>
+          <h3>Drag & Drop your video file here</h3>
+          <p>or <span class="browse-link">browse local files</span> (MP4, WebM, MKV up to 500MB)</p>
+        </div>
+
+        <div class="dropzone-preview hidden" id="dropzonePreview">
+          <div class="file-badge">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+          </div>
+          <div class="file-details">
+            <div class="file-name" id="previewFileName">demo_ui_recording.mp4</div>
+            <div class="file-meta" id="previewFileMeta">Ready to convert • 12.4 MB</div>
+          </div>
+          <button type="button" class="btn-icon" id="clearFileBtn" title="Remove file">✕</button>
+        </div>
+      </div>
+
+      <div class="upload-actions">
+        <button type="button" class="btn-primary" id="startPipelineBtn" disabled>
+          <span>Start Local Conversion</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <!-- Section 3: Live Pipeline Tracker -->
+    <section class="pipeline-section glass hidden" id="pipelineSection">
+      <div class="section-header-row">
+        <div>
+          <div class="badge-row">
+            <span class="job-id-badge" id="jobIdBadge">ID: #000000</span>
+            <span class="status-badge queued" id="jobStatusBadge">QUEUED</span>
+          </div>
+          <h2>2. Asynchronous GPU Processing Pipeline</h2>
+        </div>
+        <div class="job-stats">
+          <div class="stat-item">
+            <span class="stat-num" id="keyStatesStat">0</span>
+            <span class="stat-lbl">Key States Captured</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5-Stage Stepper -->
+      <div class="stepper-grid">
+        <div class="step-card" id="stepA">
+          <div class="step-num">01</div>
+          <div class="step-title">Module A: Temporal Parser</div>
+          <div class="step-desc">OpenCV + SSIM frame diffing isolates distinct UI state changes without duplicates.</div>
+          <div class="step-status">Waiting</div>
+        </div>
+
+        <div class="step-card" id="stepB">
+          <div class="step-num">02</div>
+          <div class="step-title">Module B: Spatial Vision</div>
+          <div class="step-desc">YOLOv10 bounding boxes, PaddleOCR typography, and Depth-Anything-V2 3D mapping.</div>
+          <div class="step-status">Waiting</div>
+        </div>
+
+        <div class="step-card" id="stepC">
+          <div class="step-num">03</div>
+          <div class="step-title">Module C: DOM Synthesizer</div>
+          <div class="step-desc">Mathematical overlap ratio nests elements into parent-child DOM trees & Z-ordering.</div>
+          <div class="step-status">Waiting</div>
+        </div>
+
+        <div class="step-card" id="stepD">
+          <div class="step-num">04</div>
+          <div class="step-title">Module D: Local Code Gen</div>
+          <div class="step-desc">Local LLM syntax compilation transcribes exact coordinates into React JSX, CSS &amp; Three.js.</div>
+          <div class="step-status">Waiting</div>
+        </div>
+
+        <div class="step-card" id="stepE">
+          <div class="step-num">05</div>
+          <div class="step-title">Packaging Project Output</div>
+          <div class="step-desc">Bundling modular components, package.json, and styles.css into deployable zip.</div>
+          <div class="step-status">Waiting</div>
+        </div>
+      </div>
+
+      <!-- Detail Box -->
+      <div class="stage-logger">
+        <div class="logger-header">
+          <span class="logger-title">Pipeline Execution Log</span>
+          <span class="logger-time" id="lastUpdatedTime">Just now</span>
+        </div>
+        <div class="logger-content" id="stageDetailText">Job queued. Waiting for worker allocation...</div>
+      </div>
+
+      <!-- Completion Actions -->
+      <div class="completion-actions hidden" id="completionActions">
+        <a href="#" class="btn-success" id="downloadZipBtn" download>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+          <span>Download Generated Code Package (.zip)</span>
+        </a>
+        <button type="button" class="btn-secondary" id="resetAppBtn">Convert Another Video</button>
+      </div>
+
+      <!-- Error Alert -->
+      <div class="error-box hidden" id="errorBox">
+        <div class="error-icon">⚠</div>
+        <div class="error-details">
+          <h4>Pipeline Execution Failed</h4>
+          <p id="errorMessageText">An error occurred during execution.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>OmniUI Architecture • 100% Locally Hosted Video-to-Code UI Generation • Offline GPU VRAM Gate</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
