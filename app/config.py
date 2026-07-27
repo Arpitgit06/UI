@@ -82,6 +82,7 @@ class Settings:
 
         # Local LLM (Module D) — loaded directly via Hugging Face / transformers
         self.local_llm_model_name = os.environ.get("OMNIUI_LLM_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
+        self.vision_llm_model_name = os.environ.get("OMNIUI_VISION_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
         self.local_llm_load_in_4bit = os.environ.get("OMNIUI_LLM_4BIT", "true").lower() == "true"
         self.local_llm_temperature = float(os.environ.get("OMNIUI_LLM_TEMPERATURE", 0.1))
         self.local_llm_max_new_tokens = int(os.environ.get("OMNIUI_LLM_MAX_TOKENS", 2048))

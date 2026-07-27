@@ -55,3 +55,5 @@ timm>=1.0.7                       # DINOv2 backbone used by Depth-Anything-V2
 # Loaded via transformers CausalLM pipeline directly inside Python:
 #   AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct", load_in_4bit=True)
 bitsandbytes>=0.43.0              # required for 4-bit / 8-bit memory-efficient LLM quantization on GPU
+qwen-vl-utils>=0.0.8              # required for Qwen2-VL processing
+

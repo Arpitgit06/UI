@@ -10,6 +10,7 @@ from app.models.schemas import Job, JobStatus
 from app.modules import (
     module_a_temporal_parser as module_a,
     module_b_spatial_vision as module_b,
+    module_b_vision_llm as module_b_fallback,
     module_c_dom_synthesizer as module_c,
     module_d_code_generator as module_d,
 )
@@ -32,7 +33,13 @@ async def run_pipeline(job: Job) -> None:
     job.key_states_detected = len(key_states)
 
     _advance(job, JobStatus.DETECTING_ELEMENTS, "running YOLOv10 / PaddleOCR / Depth-Anything-V2")
-    detections_by_state = [await module_b.analyze_state(state) for state in key_states]
+    detections_by_state = []
+    for state in key_states:
+        detections = await module_b.analyze_state(state)
+        if len([d for d in detections if d.element_type != "text"]) == 0:
+            logger.info(f"Fallback: YOLO found no UI elements for {state.image_path}, running Vision LLM.")
+            detections = await module_b_fallback.analyze_state_fallback(state)
+        detections_by_state.append(detections)
 
     _advance(job, JobStatus.SYNTHESIZING_DOM, "building parent-child layout tree")
     layouts_dir = settings.jobs_dir / job.job_id / "layouts"

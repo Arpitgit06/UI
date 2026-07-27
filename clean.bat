@@ -15,7 +15,7 @@ echo Project Location: %PROJECT_ROOT%
 echo.
 echo WARNING: This script will completely remove:
 echo   1. Python virtual environments (.venv and legacy omniui_env)
-echo   2. Downloaded AI model weights and checkpoints (models_cache\)
+echo   2. Downloaded AI models (Qwen2.5-Coder, Qwen2-VL) and checkpoints (models_cache\)
 echo   3. All uploaded videos, job records, and output zips (storage\*)
 echo   4. Compiled Python cache directories (__pycache__ and *.pyc files)
 echo.
