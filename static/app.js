@@ -22,6 +22,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const pipelineSection = document.getElementById("pipelineSection");
   const jobIdBadge = document.getElementById("jobIdBadge");
   const jobStatusBadge = document.getElementById("jobStatusBadge");
+  const jobProgressBar = document.getElementById("jobProgressBar");
+  const jobProgressText = document.getElementById("jobProgressText");
   const keyStatesStat = document.getElementById("keyStatesStat");
   const stageDetailText = document.getElementById("stageDetailText");
   const lastUpdatedTime = document.getElementById("lastUpdatedTime");
@@ -216,6 +218,11 @@ document.addEventListener("DOMContentLoaded", () => {
     // Status badge
     jobStatusBadge.textContent = job.status.toUpperCase();
     jobStatusBadge.className = `status-badge ${job.status === 'queued' ? 'queued' : (job.status === 'complete' ? 'complete' : (job.status === 'failed' ? 'failed' : 'running'))}`;
+
+    // Progress Bar
+    const progress = job.progress_percent || 0.0;
+    if (jobProgressBar) jobProgressBar.style.width = `${progress}%`;
+    if (jobProgressText) jobProgressText.textContent = `${progress.toFixed(1)}%`;
 
     // Stats and detail log
     keyStatesStat.textContent = job.key_states_detected || 0;
