@@ -65,11 +65,12 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo Installing PaddlePaddle GPU with CUDA 12.6 support...
-"%VENV_PYTHON%" -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+echo Installing PaddlePaddle (CPU-only) for OCR text detection...
+echo (OCR always runs on CPU to preserve VRAM for YOLO/LLM, so GPU paddle is not needed)
+"%VENV_PYTHON%" -m pip install paddlepaddle
 if %errorlevel% neq 0 (
-    echo WARNING: PaddlePaddle GPU wheel installation encountered an issue.
-    echo Note: If your GPU CUDA driver does not support cu126, check https://www.paddlepaddle.org.cn/en/install/quick
+    echo WARNING: PaddlePaddle installation encountered an issue.
+    echo Falling back: OCR text detection will be skipped, Vision LLM will handle text extraction.
 )
 echo.
 
@@ -107,7 +108,7 @@ echo.
 echo [6/6] Pre-caching local AI models into project directory (models_cache)...
 echo Downloading local 7B LLMs (Qwen2.5-Coder-7B-Instruct and Qwen2-VL-7B-Instruct) right now so the tool works 100%% offline forever...
 echo This will download approximately 30GB of weights. Please be patient depending on your internet speed...
-"%VENV_PYTHON%" -c "from app.config import settings; import os; os.environ['HF_HOME'] = str(settings.models_cache_dir); from huggingface_hub import snapshot_download; from transformers import pipeline; print('Downloading Depth-Anything-V2 weights into models_cache...'); pipeline(task='depth-estimation', model=settings.depth_model_name); print('Downloading Qwen2.5-Coder-7B-Instruct...'); snapshot_download(repo_id='Qwen/Qwen2.5-Coder-7B-Instruct'); print('Downloading Qwen2-VL-7B-Instruct...'); snapshot_download(repo_id='Qwen/Qwen2-VL-7B-Instruct'); print('Model pre-caching complete!')"
+"%VENV_PYTHON%" -c "from app.config import settings; import os; os.environ['HF_HOME'] = str(settings.models_cache_dir); os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'; from huggingface_hub import snapshot_download; from transformers import pipeline; print('Downloading Depth-Anything-V2 weights into models_cache...'); pipeline(task='depth-estimation', model=settings.depth_model_name); print('Downloading Qwen2.5-Coder-7B-Instruct...'); snapshot_download(repo_id='Qwen/Qwen2.5-Coder-7B-Instruct', max_workers=1); print('Downloading Qwen2-VL-7B-Instruct...'); snapshot_download(repo_id='Qwen/Qwen2-VL-7B-Instruct', max_workers=1); print('Model pre-caching complete!')"
 if %errorlevel% neq 0 (
     echo WARNING: Pre-caching encountered an issue or interruption. Models will be downloaded on-demand upon first run.
 )
