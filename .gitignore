@@ -16,6 +16,8 @@ storage/outputs/*
 !storage/uploads/.gitkeep
 !storage/jobs/.gitkeep
 !storage/outputs/.gitkeep
+omniui_*
+*.zip
 
 models_cache/*
 !models_cache/.gitkeep
