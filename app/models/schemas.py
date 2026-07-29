@@ -92,3 +92,6 @@ class Job(BaseModel):
     error_message: Optional[str] = None
     current_stage_detail: Optional[str] = None
     key_states_detected: int = 0
+    progress_percent: float = 0.0
+    enable_3d: bool = False
+

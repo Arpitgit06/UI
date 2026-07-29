@@ -68,6 +68,37 @@ class LocalLLMValidationError(RuntimeError):
     """Raised when generated code fails the mechanical no-hallucination check after all retries."""
 
 
+def _fix_json_string_escaping(text: str) -> str:
+    """Fix unescaped newlines/tabs/CR inside JSON string values."""
+    result = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == '\\' and in_string and i + 1 < len(text):
+            result.append(c)
+            result.append(text[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            in_string = not in_string
+            result.append(c)
+            i += 1
+            continue
+        if in_string:
+            if c == '\n':
+                result.append('\\n')
+            elif c == '\r':
+                result.append('\\r')
+            elif c == '\t':
+                result.append('\\t')
+            else:
+                result.append(c)
+        else:
+            result.append(c)
+        i += 1
+    return ''.join(result)
+
 
 
 # Scene-unit constants for the 2D-pixel -> R3F-scene projection. Arbitrary
@@ -337,78 +368,237 @@ def _validate_scene3d(code_tree: dict, scene3d_jsx: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Fast Deterministic Python Code Generator
+# (Bypasses LLM token generation latency and JSON formatting bugs)
+# ---------------------------------------------------------------------------
+
+
+def _render_tree_to_jsx_and_css(code_tree: dict, component_name: str) -> tuple[str, str]:
+    css_rules = []
+
+    def _render_node(node: dict, indent: int = 4) -> str:
+        cls = node["class_name"]
+        tag = node["tag"] or "div"
+        text = node["text"] or ""
+
+        rule_lines = [f".{cls} {{"]
+        for k, v in node["css"].items():
+            rule_lines.append(f"  {k}: {v};")
+        rule_lines.append("}")
+        css_rules.append("\n".join(rule_lines))
+
+        ind = " " * indent
+        children_jsx = []
+        for child in node["children"]:
+            children_jsx.append(_render_node(child, indent + 2))
+
+        if text and children_jsx:
+            content = f"\n{ind}  {text}" + "".join(children_jsx) + f"\n{ind}"
+        elif text:
+            content = text
+        elif children_jsx:
+            content = "".join(children_jsx) + f"\n{ind}"
+        else:
+            content = ""
+
+        if content:
+            return f"\n{ind}<{tag} className=\"{cls}\">{content}</{tag}>"
+        else:
+            return f"\n{ind}<{tag} className=\"{cls}\" />"
+
+    root_jsx = _render_node(code_tree, indent=6)
+
+    component_jsx = (
+        f"import React from 'react';\n\n"
+        f"export default function {component_name}() {{\n"
+        f"  return ({root_jsx}\n"
+        f"  );\n"
+        f"}}\n"
+    )
+    styles_css = "\n\n".join(css_rules)
+    return component_jsx, styles_css
+
+
+def _render_tree_to_scene3d_jsx(code_tree: dict, component_name: str) -> str:
+    meshes = []
+    
+    def _walk(node: dict):
+        if "position_3d" in node and node["position_3d"]:
+            p = node["position_3d"]
+            x, y, z = p["position"]
+            w, h = p["width"], p["height"]
+            color = node["css"].get("background-color", "#cccccc")
+            if not color.startswith("#"):
+                color = "#cccccc"
+            meshes.append(
+                f"        <mesh position={{[{x:.2f}, {y:.2f}, {z:.2f}]}}>\n"
+                f"          <planeGeometry args={{[{w:.2f}, {h:.2f}]}} />\n"
+                f"          <meshStandardMaterial color=\"{color}\" />\n"
+                f"        </mesh>"
+            )
+        for child in node.get("children", []):
+            _walk(child)
+            
+    _walk(code_tree)
+    
+    meshes_str = "\n".join(meshes)
+    return (
+        f"import React from 'react';\n"
+        f"import {{ Canvas }} from '@react-three/fiber';\n\n"
+        f"export default function Scene3D_{component_name}() {{\n"
+        f"  return (\n"
+        f"    <div style={{{{ width: '100vw', height: '100vh' }}}}>\n"
+        f"      <Canvas camera={{{{ position: [0, 0, 1500] }}}}>\n"
+        f"        <ambientLight intensity={{0.5}} />\n"
+        f"        <directionalLight position={{[10, 10, 5]}} intensity={{1}} />\n"
+        f"{meshes_str}\n"
+        f"      </Canvas>\n"
+        f"    </div>\n"
+        f"  );\n"
+        f"}}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Local LLM calls
 # ---------------------------------------------------------------------------
 
 
-async def _call_local_llm_structured(
-    model: str, system_prompt: str, user_content: str, schema: dict, temperature: float, load_in_4bit: bool
-) -> dict:
-    import subprocess
-    import sys
-    import uuid
+import subprocess
+import threading
+import sys
 
-    payload_file = settings.jobs_dir / f"llm_payload_{uuid.uuid4().hex}.json"
-    payload_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(payload_file, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "model_name": model,
-                    "system_prompt": system_prompt,
-                    "user_content": user_content,
-                    "temperature": temperature,
-                    "max_new_tokens": settings.local_llm_max_new_tokens,
-                    "load_in_4bit": load_in_4bit,
-                },
-                f,
-            )
-
-        def _run_subprocess():
-            import subprocess
-            return subprocess.run(
-                [sys.executable, "-m", "app.modules.llm_subprocess_worker", str(payload_file)],
+class PersistentLLMWorker:
+    def __init__(self, max_jobs=4):
+        self.process = None
+        self.lock = threading.Lock()
+        self.jobs_processed = 0
+        self.max_jobs = max_jobs
+        self.current_model = None
+        
+    def start(self, model: str, load_in_4bit: bool):
+        if self.process is None or self.process.poll() is not None or self.current_model != model:
+            if self.process:
+                self.shutdown()
+                
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "app.modules.llm_subprocess_worker"],
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=None,
                 text=True,
+                bufsize=1,
                 encoding="utf-8",
                 errors="replace"
             )
-
-        completed_process = await asyncio.to_thread(_run_subprocess)
-        
-        stdout_lines = completed_process.stdout.splitlines(keepends=True)
-        
-        for line in stdout_lines:
-            if "__LLM_JSON_START__" not in line and "__LLM_JSON_END__" not in line and line.strip():
-                logger.info(f"[LLM Worker STDOUT] {line.strip()}")
+            self.jobs_processed = 0
+            self.current_model = model
+            
+            init_payload = {
+                "model_name": model,
+                "load_in_4bit": load_in_4bit
+            }
+            self.process.stdin.write(json.dumps(init_payload) + "\n")
+            self.process.stdin.flush()
+            
+    def analyze(self, model: str, system_prompt: str, user_content: str, temperature: float, load_in_4bit: bool) -> dict:
+        with self.lock:
+            self.start(model, load_in_4bit)
+            
+            payload = {
+                "system_prompt": system_prompt,
+                "user_content": user_content,
+                "temperature": temperature,
+                "max_new_tokens": settings.local_llm_max_new_tokens
+            }
+            self.process.stdin.write(json.dumps(payload) + "\n")
+            self.process.stdin.flush()
+            
+            output = ""
+            while True:
+                line = self.process.stdout.readline()
+                if not line:
+                    self.process = None
+                    raise LocalLLMConnectionError("Local LLM worker subprocess died unexpectedly.")
                 
-        process_returncode = completed_process.returncode
-        stdout = completed_process.stdout
-        stderr = ""
-    finally:
-        if payload_file.exists():
+                if "__LLM_JSON_START__" not in line and "__LLM_JSON_END__" not in line and line.strip():
+                    logger.info(f"[LLM Worker STDOUT] {line.strip()}")
+                    
+                output += line
+                if "__LLM_JSON_END__" in output:
+                    break
+                    
+            if "__LLM_JSON_START__" not in output or "__LLM_JSON_END__" not in output:
+                raise LocalLLMGenerationError("Local LLM response did not contain expected JSON markers.")
+                
+            json_str = output.split("__LLM_JSON_START__")[1].split("__LLM_JSON_END__")[0].strip()
+            
             try:
-                payload_file.unlink()
-            except Exception:
+                return json.loads(json_str)
+            except (json.JSONDecodeError, AttributeError):
                 pass
 
-    if process_returncode != 0:
-        raise LocalLLMConnectionError(
-            f"Local LLM worker subprocess failed (model={model!r}). "
-            f"Underlying error/stderr: {stderr or stdout}"
-        )
+            fixed = _fix_json_string_escaping(json_str)
+            try:
+                return json.loads(fixed)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+                
+            first_brace = fixed.find('{')
+            if first_brace != -1:
+                depth = 0
+                in_string = False
+                escape_next = False
+                for i in range(first_brace, len(fixed)):
+                    c = fixed[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if c == '\\':
+                        escape_next = True
+                        continue
+                    if c == '"':
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            candidate = fixed[first_brace:i + 1]
+                            try:
+                                return json.loads(candidate)
+                            except (json.JSONDecodeError, ValueError):
+                                break
 
-    if "__LLM_JSON_START__" not in stdout or "__LLM_JSON_END__" not in stdout:
-        raise LocalLLMGenerationError(
-            f"Local LLM response did not contain expected JSON markers. Raw stdout: {stdout[:500]}"
-        )
+            raise LocalLLMGenerationError("Local LLM response wasn't valid JSON.")
 
-    json_str = stdout.split("__LLM_JSON_START__")[1].split("__LLM_JSON_END__")[0].strip()
-    try:
-        return json.loads(json_str)
-    except (json.JSONDecodeError, AttributeError) as exc:
-        raise LocalLLMGenerationError(f"Local LLM response wasn't valid JSON: {exc}. Raw: {json_str[:200]}") from exc
+    def shutdown_if_needed(self):
+        with self.lock:
+            self.jobs_processed += 1
+            if self.jobs_processed >= self.max_jobs:
+                self.shutdown()
+                
+    def shutdown(self):
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
+                self.process.stdin.flush()
+                self.process.wait(timeout=10)
+            except Exception:
+                self.process.kill()
+            self.process = None
+
+_global_llm_worker = PersistentLLMWorker()
+
+async def _call_local_llm_structured(
+    model: str, system_prompt: str, user_content: str, schema: dict, temperature: float, load_in_4bit: bool
+) -> dict:
+    def _run():
+        return _global_llm_worker.analyze(model, system_prompt, user_content, temperature, load_in_4bit)
+    return await asyncio.to_thread(_run)
 
 
 async def _generate_component_and_styles(
@@ -516,21 +706,39 @@ async def generate_code(
         code_tree = _build_code_ready_tree(layout.root, layout.state_name)
         component_name = _pascal_case(layout.state_name)
 
-        component_jsx, styles_css = await _generate_component_and_styles(
-            code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
-        )
+        try:
+            component_jsx, styles_css = await _generate_component_and_styles(
+                code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
+            )
+            if component_jsx.lstrip().startswith('{') or "import React" not in component_jsx:
+                logger.warning(f"{component_name}: LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
+                component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
+        except Exception as e:
+            logger.warning(f"{component_name}: LLM generation failed ({e}); falling back to deterministic Python renderer.")
+            component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
+
         files[f"{component_name}.jsx"] = component_jsx
         css_blocks.append(styles_css)
 
         if layout.is_3d_scene:
             any_3d = True
-            scene3d_jsx = await _generate_scene3d(
-                code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
-            )
+            try:
+                scene3d_jsx = await _generate_scene3d(
+                    code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
+                )
+                if scene3d_jsx.lstrip().startswith('{') or "import React" not in scene3d_jsx:
+                    logger.warning(f"{component_name}: 3D LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
+                    scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
+            except Exception as e:
+                logger.warning(f"{component_name}: 3D LLM generation failed ({e}); falling back to deterministic Python renderer.")
+                scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
+            
             files[f"Scene3D_{component_name}.jsx"] = scene3d_jsx
 
         logger.info(f"Module D: generated {component_name} ({len(code_tree['children'])} top-level child node(s))")
 
+    _global_llm_worker.shutdown_if_needed()
+    
     files["styles.css"] = "\n\n".join(css_blocks)
     files["index.jsx"] = _build_index_scaffold(layouts)
     files["package.json"] = _build_package_json(any_3d)

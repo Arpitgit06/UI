@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -101,7 +101,10 @@ async def health() -> dict:
 
 
 @app.post("/jobs", response_model=Job)
-async def create_job(video: UploadFile = File(...)) -> Job:
+async def create_job(
+    video: UploadFile = File(...),
+    enable_3d: bool = Form(False)
+) -> Job:
     if video.content_type not in ACCEPTED_VIDEO_TYPES:
         raise HTTPException(415, f"Unsupported content type: {video.content_type}")
 
@@ -116,10 +119,11 @@ async def create_job(video: UploadFile = File(...)) -> Job:
         created_at=now,
         updated_at=now,
         source_video_path=str(dest_path),
+        enable_3d=enable_3d,
     )
     job_queue.register(job)
     await job_queue.enqueue(job_id)
-    logger.info(f"Job {job_id} queued ({video.filename}, {dest_path.stat().st_size} bytes)")
+    logger.info(f"Job {job_id} queued ({video.filename}, {dest_path.stat().st_size} bytes, 3d={enable_3d})")
     return job
 
 

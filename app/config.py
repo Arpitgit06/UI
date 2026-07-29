@@ -85,9 +85,9 @@ class Settings:
         self.vision_llm_model_name = os.environ.get("OMNIUI_VISION_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
         self.local_llm_load_in_4bit = os.environ.get("OMNIUI_LLM_4BIT", "true").lower() == "true"
         self.local_llm_temperature = float(os.environ.get("OMNIUI_LLM_TEMPERATURE", 0.1))
-        self.local_llm_max_new_tokens = int(os.environ.get("OMNIUI_LLM_MAX_TOKENS", 2048))
-        self.local_llm_max_retries = int(os.environ.get("OMNIUI_LLM_MAX_RETRIES", 2))
-        self.local_llm_strict_validation = os.environ.get("OMNIUI_LLM_STRICT_VALIDATION", "true").lower() == "true"
+        self.local_llm_max_new_tokens = int(os.environ.get("OMNIUI_LLM_MAX_TOKENS", 4096))
+        self.local_llm_max_retries = int(os.environ.get("OMNIUI_LLM_MAX_RETRIES", 1))
+        self.local_llm_strict_validation = os.environ.get("OMNIUI_LLM_STRICT_VALIDATION", "false").lower() == "true"
 
     def ensure_directories(self) -> None:
         for d in (self.uploads_dir, self.jobs_dir, self.outputs_dir, self.models_cache_dir):

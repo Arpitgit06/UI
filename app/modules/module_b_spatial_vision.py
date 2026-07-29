@@ -301,47 +301,82 @@ def _load_depth_pipeline(model_name: str, device: str):
 # ---------------------------------------------------------------------------
 
 
-def _run_paddleocr_subprocess(image_path: str, device: str, lang: str, confidence_threshold: float) -> list[dict]:
-    """
-    Runs PaddleOCR in a short-lived standalone subprocess on Windows to avoid WinError 127
-    DLL symbol collisions when both PyTorch (YOLOv10) and PaddlePaddle (PaddleOCR)
-    run in the same process address space, and to guarantee 100% VRAM cleanup
-    upon OS-level process termination.
-    """
-    import json
-    import subprocess
-    import sys
+import subprocess
+import sys
+import json
+import threading
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "app.modules.ocr_subprocess_worker",
-            image_path,
-            device,
-            lang,
-            str(confidence_threshold),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.error(f"PaddleOCR subprocess failed. stdout: {result.stdout}, stderr: {result.stderr}")
-        return []
+class PersistentOCRWorker:
+    def __init__(self, max_jobs=4):
+        self.process = None
+        self.lock = threading.Lock()
+        self.jobs_processed = 0
+        self.max_jobs = max_jobs
+        
+    def start(self):
+        if self.process is None or self.process.poll() is not None:
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "app.modules.ocr_subprocess_worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+            self.jobs_processed = 0
+            
+    def analyze(self, image_paths: list[str], lang: str, confidence_threshold: float) -> list[list[dict]]:
+        with self.lock:
+            self.jobs_processed += 1
+            if self.jobs_processed > self.max_jobs:
+                self.shutdown()
+            self.start()
+            
+            payload = {
+                "image_paths": image_paths,
+                "lang": lang,
+                "confidence_threshold": confidence_threshold
+            }
+            self.process.stdin.write(json.dumps(payload) + "\n")
+            self.process.stdin.flush()
+            
+            output = ""
+            while True:
+                line = self.process.stdout.readline()
+                if not line:
+                    logger.error(f"OCR Subprocess died. Stderr: {self.process.stderr.read()}")
+                    self.process = None
+                    return [[] for _ in image_paths]
+                output += line
+                if "__OCR_JSON_END__" in output:
+                    break
+                    
+            try:
+                json_str = output.split("__OCR_JSON_START__")[1].split("__OCR_JSON_END__")[0].strip()
+                result = json.loads(json_str)
+                if result.get("status") == "error":
+                    logger.error(f"OCR Subprocess Error: {result.get('message')}")
+                    return [[] for _ in image_paths]
+                return result.get("detections", [])
+            except Exception as e:
+                logger.error(f"Failed to parse OCR subprocess output: {e}")
+                return [[] for _ in image_paths]
+                
+    def shutdown(self):
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
+                self.process.stdin.flush()
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+            self.process = None
 
-    stdout = result.stdout
-    if "__OCR_JSON_START__" in stdout and "__OCR_JSON_END__" in stdout:
-        json_str = stdout.split("__OCR_JSON_START__")[1].split("__OCR_JSON_END__")[0].strip()
-        try:
-            return json.loads(json_str)
-        except Exception as e:
-            logger.error(f"Failed to parse OCR subprocess JSON: {e}")
-            return []
-    return []
+_global_ocr_worker = PersistentOCRWorker()
 
 
-def _analyze_state_sync(
-    state: KeyStateFrame,
+def _analyze_states_sync(
+    states: list[KeyStateFrame],
     yolo_weights_path: Optional[str] = None,
     yolo_confidence_threshold: Optional[float] = None,
     ocr_lang: Optional[str] = None,
@@ -349,7 +384,11 @@ def _analyze_state_sync(
     depth_model_name: Optional[str] = None,
     colors_per_element: Optional[int] = None,
     cuda_device_index: Optional[int] = None,
-) -> list[DetectedElement]:
+    enable_3d: bool = False,
+) -> list[list[DetectedElement]]:
+    if not states:
+        return []
+
     yolo_weights_path = yolo_weights_path or settings.yolo_weights_path
     yolo_confidence_threshold = (
         settings.yolo_confidence_threshold if yolo_confidence_threshold is None else yolo_confidence_threshold
@@ -368,67 +407,98 @@ def _analyze_state_sync(
     # for why these two frameworks need separate handling throughout.
     paddle_device = "cpu" if torch_device == "cpu" else f"gpu:{cuda_device_index}"
 
-    image = Image.open(state.image_path).convert("RGB")
+    images = [Image.open(state.image_path).convert("RGB") for state in states]
     guard = GPUPipelineGuard(device_index=cuda_device_index)
 
+    logger.info("Starting YOLO stage...")
     with guard.stage(
         "yolov10",
         loader=lambda: _load_yolo(yolo_weights_path, torch_device),
         unloader=lambda m: m.to("cpu"),
         min_free_mb=1024,
     ) as model:
-        results = model.predict(state.image_path, conf=yolo_confidence_threshold, verbose=False)
-        yolo_detections = _parse_yolo_boxes(results[0].boxes, results[0].names)
+        logger.info(f"YOLO loaded. Running predict in batch on {len(states)} images...")
+        image_paths = [state.image_path for state in states]
+        results = model.predict(image_paths, conf=yolo_confidence_threshold, verbose=False)
+        yolo_detections_list = [_parse_yolo_boxes(res.boxes, res.names) for res in results]
+        logger.info("YOLO stage complete.")
 
+    logger.info("Starting PaddleOCR stage...")
     with guard.stage(
         "paddleocr",
         loader=lambda: "subprocess_ready",
         unloader=lambda _x: None,
         min_free_mb=1024,
     ):
-        ocr_detections = _run_paddleocr_subprocess(state.image_path, paddle_device, ocr_lang, ocr_confidence_threshold)
+        logger.info("Running PaddleOCR subprocess...")
+        ocr_detections_list = _global_ocr_worker.analyze([s.image_path for s in states], ocr_lang, ocr_confidence_threshold)
+        logger.info("PaddleOCR stage complete.")
 
-    with guard.stage(
-        "depth-anything-v2",
-        loader=lambda: _load_depth_pipeline(depth_model_name, torch_device),
-        unloader=lambda p: p.model.to("cpu"),
-        min_free_mb=1536,
-    ) as depth_pipe:
-        depth_result = depth_pipe(image)
-        depth_array = np.array(depth_result["depth"])
+    depth_array_list = []
+    if enable_3d:
+        logger.info("Starting Depth-Anything-V2 stage...")
+        with guard.stage(
+            "depth-anything-v2",
+            loader=lambda: _load_depth_pipeline(depth_model_name, torch_device),
+            unloader=lambda p: p.model.to("cpu"),
+            min_free_mb=1536,
+        ) as depth_pipe:
+            logger.info(f"Depth-Anything-V2 loaded. Running predict in batch on {len(images)} images...")
+            depth_results = depth_pipe(images, batch_size=4)
+            if isinstance(depth_results, dict):
+                depth_results = [depth_results] # Handle single image edge case
+            depth_array_list = [np.array(res["depth"]) for res in depth_results]
+            logger.info("Depth-Anything-V2 stage complete.")
+    else:
+        logger.info("Skipping Depth-Anything-V2 stage (enable_3d=False).")
+        depth_array_list = [None for _ in images]
 
-    # Combine: one DetectedElement per YOLO box, one per OCR text region.
-    # No cross-referencing here -- see the module docstring.
-    raw_items = [{"kind": "yolo", **d} for d in yolo_detections] + [
-        {"kind": "ocr", **d} for d in ocr_detections
-    ]
-    raw_depths = [_sample_depth_region(depth_array, item["bbox"]) for item in raw_items]
-    z_indices = _normalize_z_indices(raw_depths)
+    all_elements = []
+    for state, image, yolo_detections, ocr_detections, depth_array in zip(states, images, yolo_detections_list, ocr_detections_list, depth_array_list):
+        raw_items = [{"kind": "yolo", **d} for d in yolo_detections] + [
+            {"kind": "ocr", **d} for d in ocr_detections
+        ]
+        
+        # Sort by confidence descending and cap to top 40 elements to prevent massive LLM context bloat
+        # which causes VRAM exhaustion and PCIe thrashing during the 7B model prefill phase.
+        raw_items.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+        raw_items = raw_items[:40]
+        
+        if depth_array is not None:
+            raw_depths = [_sample_depth_region(depth_array, item["bbox"]) for item in raw_items]
+            z_indices = _normalize_z_indices(raw_depths)
+        else:
+            z_indices = [None for _ in raw_items]
 
-    elements: list[DetectedElement] = []
-    for idx, (item, z) in enumerate(zip(raw_items, z_indices)):
-        x, y, w, h = item["bbox"]
-        crop = image.crop((int(x), int(y), int(x + w), int(y + h)))
-        hex_colors = _extract_hex_colors(crop, colors_per_element)
+        elements: list[DetectedElement] = []
+        for idx, (item, z) in enumerate(zip(raw_items, z_indices)):
+            x, y, w, h = item["bbox"]
+            crop = image.crop((int(x), int(y), int(x + w), int(y + h)))
+            hex_colors = _extract_hex_colors(crop, colors_per_element)
 
-        is_text = item["kind"] == "ocr"
-        elements.append(
-            DetectedElement(
-                element_id=f"{item['kind']}-{idx:03d}",
-                element_type="text" if is_text else item["label"],
-                bbox=BoundingBox(x=x, y=y, width=w, height=h, z_index=round(z, 2)),
-                text_content=item["text"] if is_text else None,
-                hex_colors=hex_colors,
-                confidence=round(item["confidence"], 4),
+            is_text = item["kind"] == "ocr"
+            elements.append(
+                DetectedElement(
+                    element_id=f"{item['kind']}-{idx:03d}",
+                    element_type="text" if is_text else item["label"],
+                    bbox=BoundingBox(x=x, y=y, width=w, height=h, z_index=round(z, 2)),
+                    text_content=item["text"] if is_text else None,
+                    hex_colors=hex_colors,
+                    confidence=round(item["confidence"], 4),
+                )
             )
+
+        logger.info(
+            f"Module B: {state.image_path} -> {len(yolo_detections)} YOLO, {len(ocr_detections)} OCR. Capped to {len(elements)} elements for LLM context."
         )
+        all_elements.append(elements)
 
-    logger.info(
-        f"Module B: {state.image_path} -> {len(yolo_detections)} element(s), "
-        f"{len(ocr_detections)} text region(s)"
-    )
-    return elements
+    return all_elements
 
+
+async def analyze_states(states: list[KeyStateFrame], **kwargs) -> list[list[DetectedElement]]:
+    return await asyncio.to_thread(_analyze_states_sync, states, **kwargs)
 
 async def analyze_state(state: KeyStateFrame, **kwargs) -> list[DetectedElement]:
-    return await asyncio.to_thread(_analyze_state_sync, state, **kwargs)
+    res = await analyze_states([state], **kwargs)
+    return res[0] if res else []

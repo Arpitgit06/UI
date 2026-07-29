@@ -25,7 +25,9 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Generator, Optional
 
-logger = logging.getLogger("omniui.vram")
+from app.utils.logger import get_logger
+
+logger = get_logger("omniui.vram")
 
 try:
     import torch
@@ -166,8 +168,11 @@ class ManagedModel:
             self._model = None
             gc.collect()
             if _TORCH_AVAILABLE and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                except Exception as e:
+                    logger.warning(f"[{self.name}] Non-fatal error during torch.cuda cache clear: {e}")
             logger.info(f"[{self.name}] unloaded, cache cleared ({_snapshot(self.device_index)})")
 
 

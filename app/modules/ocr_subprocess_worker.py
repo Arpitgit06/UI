@@ -11,12 +11,29 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-# BULLETPROOF DLL FIX: PyTorch and PaddlePaddle both ship with cuDNN DLLs.
-# If Paddle loads first, it pollutes the DLL search path and crashes Torch
-# with WinError 127. By eagerly importing Torch here at the very top, we
-# force Windows to load Torch's DLLs into memory safely before Paddle starts.
+# CRITICAL: These env vars MUST be set before `import paddle` to prevent
+# PaddlePaddle from loading CUDA/cuDNN DLLs at import time. Setting them
+# after import is too late and causes WinError 127 on Windows when
+# paddlepaddle-gpu is installed alongside PyTorch with a different CUDA version.
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["USE_GPU"] = "0"
+os.environ["FLAGS_use_gpu"] = "0"
+os.environ["FLAGS_enable_pir_in_executor"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+
+# WINDOWS DLL CONFLICT FIX: PaddleOCR -> paddlex -> modelscope transitively
+# imports torch. If paddle's C++ runtime loads first, it blocks torch's shm.dll
+# (WinError 127). We must (1) register torch's DLL directory and (2) import torch
+# BEFORE any paddle code runs.
+_torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+if os.path.isdir(_torch_lib):
+    try:
+        os.add_dll_directory(_torch_lib)
+    except (OSError, AttributeError):
+        pass
 try:
-    import torch
+    import torch  # noqa: F401 — must load torch DLLs before paddle
 except ImportError:
     pass
 
@@ -90,22 +107,8 @@ def _parse_paddleocr_result(res) -> list[dict]:
 
 
 def main() -> None:
-    if len(sys.argv) < 5:
-        sys.exit(1)
-
-    image_path = sys.argv[1]
-    # We ignore sys.argv[2] (device) and force CPU to avoid PyTorch DLL conflicts
-    lang = sys.argv[3]
-    confidence_threshold = float(sys.argv[4])
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-    os.environ["USE_GPU"] = "0"
-    # Disable PIR executor — crashes with oneDNN on CPU/Windows
-    # See: https://github.com/PaddlePaddle/Paddle/issues/70255
-    os.environ["FLAGS_enable_pir_in_executor"] = "0"
-    os.environ["FLAGS_use_mkldnn"] = "0"
-    os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
-
+    # Note: CUDA_VISIBLE_DEVICES, USE_GPU, FLAGS_* are all set at module level
+    # (before `import paddle`) to prevent DLL loading issues on Windows.
     try:
         import paddle
         
@@ -116,23 +119,42 @@ def main() -> None:
         from paddleocr import PaddleOCR
 
         # Always run on CPU: it takes <200ms per image and saves VRAM for YOLO/LLM
-        ocr = PaddleOCR(
-            lang=lang,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=True,
-            device="cpu",
-        )
-        
-        ocr_raw = ocr.predict(image_path)
-        ocr_detections = []
-        for res in ocr_raw:
-            ocr_detections.extend(_parse_paddleocr_result(res))
-        ocr_detections = [d for d in ocr_detections if d.get("confidence", 0.0) >= confidence_threshold]
+        ocr = None
 
-        print("__OCR_JSON_START__")
-        print(json.dumps(ocr_detections))
-        print("__OCR_JSON_END__")
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+                
+            payload = json.loads(line)
+            if payload.get("command") == "shutdown":
+                break
+                
+            image_paths = payload.get("image_paths", [])
+            lang = payload.get("lang", "en")
+            confidence_threshold = float(payload.get("confidence_threshold", 0.5))
+            
+            if ocr is None:
+                ocr = PaddleOCR(
+                    lang=lang,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=True,
+                    device="cpu",
+                )
+            
+            all_ocr_detections = []
+            for img_path in image_paths:
+                ocr_raw = ocr.predict(img_path)
+                ocr_detections = []
+                for res in ocr_raw:
+                    ocr_detections.extend(_parse_paddleocr_result(res))
+                ocr_detections = [d for d in ocr_detections if d.get("confidence", 0.0) >= confidence_threshold]
+                all_ocr_detections.append(ocr_detections)
+
+            response = {"status": "success", "detections": all_ocr_detections}
+            print("__OCR_JSON_START__\n" + json.dumps(response) + "\n__OCR_JSON_END__", flush=True)
+
     except Exception as e:
         print(f"PaddleOCR Subprocess Error: {e}", file=sys.stderr)
         import traceback
