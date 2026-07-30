@@ -37,6 +37,9 @@ numpy>=1.26.4,<2.0.0            # pinned <2.0 for opencv/paddle ABI compatibilit
 
 # --- Module B: Spatial Vision & Detection Engine ---
 ultralytics>=8.3.0               # YOLOv10 loads directly through this package's YOLO class
+onnx>=1.12.0                      # Required by Ultralytics for ONNX export
+onnxruntime-gpu                   # Required by Ultralytics for ONNX execution on GPU
+onnxslim>=0.1.82                  # Required by Ultralytics for ONNX export
 paddleocr>=3.0.0                  # paddlepaddle-gpu/paddlepaddle installed separately, see note above
 colorgram.py>=1.2.0
 Pillow>=10.3.0
