@@ -167,6 +167,13 @@ document.addEventListener("DOMContentLoaded", () => {
     } else {
       formData.append("enable_3d", "false");
     }
+    
+    const fastModeToggle = document.getElementById("fastModeToggle");
+    if (fastModeToggle && fastModeToggle.checked) {
+      formData.append("fast_mode", "true");
+    } else {
+      formData.append("fast_mode", "false");
+    }
 
     try {
       const res = await fetch("/jobs", {
