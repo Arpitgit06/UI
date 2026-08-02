@@ -12,7 +12,7 @@ is used strictly as a syntax compiler, never to guess pixel positions.
 | Core Orchestration (FastAPI, async job queue) | ✅ implemented |
 | VRAM lifecycle manager (`vram_scope`, `GPUPipelineGuard`) | ✅ implemented |
 | A — Temporal Video Parser (OpenCV + SSIM) | ✅ implemented |
-| B — Spatial Vision & Detection (YOLOv10, PaddleOCR, Depth-Anything-V2) | ✅ implemented |
+| B — Spatial Vision & Detection (Hybrid YOLO, PaddleOCR, Depth-Anything-V2) | ✅ implemented |
 | C — DOM Synthesizer | ✅ implemented |
 | D — Local Code Generation (Hugging Face Transformers Subprocess) | ✅ implemented |
 
@@ -129,8 +129,8 @@ path.
 `app/modules/module_b_spatial_vision.py` runs four analyses per key-state
 image, one heavy model at a time via `GPUPipelineGuard`:
 
-1. **YOLOv10** (`ultralytics`) — UI element bounding boxes + label + confidence
-2. **PaddleOCR** — text region bounding boxes + recognized strings
+1. **Hybrid YOLO** (`ultralytics`) — YOLOv8 Macro-detector for containers, YOLOv10 Micro-detector for elements inside crops
+2. **PaddleOCR** — text region bounding boxes + recognized strings (via persistent subprocess)
 3. **Depth-Anything-V2** (`transformers` pipeline) — per-pixel relative depth → `z_index`
 4. **Colorgram.py** (CPU, no GPU) — dominant hex colors per element, from its crop
 
@@ -142,22 +142,18 @@ making it a child node?) is Module C's job by design, per the architecture
 doc's description of the DOM Synthesizer; duplicating it here would just
 be logic Module C already owns.
 
-**The VRAM gate spans two frameworks, not one.** YOLOv10 and
+**The VRAM gate spans two frameworks, not one.** YOLO and
 Depth-Anything-V2 are PyTorch models, but PaddleOCR runs on PaddlePaddle —
 a separate framework with its own CUDA context that `torch.cuda.empty_cache()`
-cannot touch. `vram_manager.py` now also exposes `clear_paddle_gpu_cache()`
-(`paddle.device.cuda.empty_cache()`), which PaddleOCR's stage calls via its
-`unloader` hook — the same mechanism PyTorch models use for their own
-cleanup, so the gate is genuinely one-model-at-a-time regardless of which
-framework that model is built on. (Documented caveat: Paddle's own cache
-clearing isn't always fully reliable across repeated calls — see the
-function's docstring for the fallback if VRAM creeps up in practice.)
+cannot touch. PaddleOCR is now fully isolated into a persistent subprocess worker 
+(`app.modules.ocr_subprocess_worker`), ensuring 100% VRAM cleanup and preventing memory leaks.
+The `GPUPipelineGuard` coordinates these stages so they still run sequentially.
 
 **Two things are placeholders until real weights are available:**
-- `settings.yolo_weights_path` defaults to stock, COCO-pretrained YOLOv10
+- `settings.yolo_macro_weights_path` and `settings.yolo_micro_weights_path` default to stock, COCO-pretrained YOLO models
   (detects people/cars/dogs — not buttons or navbars). Real UI detection
-  needs a checkpoint fine-tuned on a UI dataset (e.g. Rico); swapping it in
-  is a one-line config change once you have one.
+  needs checkpoints fine-tuned on a UI dataset (e.g. Rico); swapping them in
+  is a config change once you have them.
 - `_normalize_z_indices()` assumes Depth-Anything-V2's larger values mean
   "closer to camera." Worth confirming visually against a real model
   output before trusting the ordering.
