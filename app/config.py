@@ -54,18 +54,19 @@ class Settings:
         self.min_free_vram_mb = float(os.environ.get("OMNIUI_MIN_FREE_VRAM_MB", 512.0))
         self.cuda_device_index = int(os.environ.get("OMNIUI_CUDA_DEVICE", 0))
 
-        # Module B: Spatial Vision & Detection
-        # NOTE on yolo_weights_path: the stock "yolov10n.pt" checkpoint is
-        # COCO-pretrained (person/car/dog/...) -- it does NOT know what a
-        # button or navbar is. Real UI detection needs a checkpoint
-        # fine-tuned on a UI dataset (e.g. Rico). Point this at that
-        # checkpoint (under models_cache/) once you have one; until then,
-        # this wires up the real inference/VRAM-gate plumbing against
-        # placeholder weights so the pipeline is testable end-to-end.
-        self.yolo_weights_path = os.environ.get(
-            "OMNIUI_YOLO_WEIGHTS",
-            str(self.models_cache_dir / "yolov10n.pt"),
+        # Module B: Spatial Vision & Detection (Hybrid ONNX Architecture)
+        # Macro model detects large layout containers (cards, modals)
+        self.yolo_macro_weights_path = os.environ.get(
+            "OMNIUI_YOLO_MACRO_WEIGHTS",
+            str(self.models_cache_dir / "yolov8_macro.pt"),
         )
+        # Micro model detects dense nested elements (icons, text inputs)
+        self.yolo_micro_weights_path = os.environ.get(
+            "OMNIUI_YOLO_MICRO_WEIGHTS",
+            str(self.models_cache_dir / "yolov10_micro.pt"),
+        )
+        self.yolo_export_onnx = os.environ.get("OMNIUI_YOLO_EXPORT_ONNX", "false").lower() == "true"
+        
         self.yolo_confidence_threshold = float(os.environ.get("OMNIUI_YOLO_CONF", 0.25))
         self.paddleocr_lang = os.environ.get("OMNIUI_OCR_LANG", "en")
         self.ocr_confidence_threshold = float(os.environ.get("OMNIUI_OCR_CONF", 0.5))

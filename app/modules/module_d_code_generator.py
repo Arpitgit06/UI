@@ -685,6 +685,7 @@ async def _generate_scene3d(
 
 async def generate_code(
     layouts: list[LayoutState],
+    fast_mode: bool = False,
     code_model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_retries: Optional[int] = None,
@@ -696,7 +697,10 @@ async def generate_code(
     strict_validation = settings.local_llm_strict_validation if strict_validation is None else strict_validation
     load_in_4bit = settings.local_llm_load_in_4bit
 
-    logger.info(f"Module D executing local code generation with model: {code_model} (4-bit={load_in_4bit})")
+    if fast_mode:
+        logger.info("Module D executing in Fast Mode (Skipping LLM)")
+    else:
+        logger.info(f"Module D executing local code generation with model: {code_model} (4-bit={load_in_4bit})")
 
     files: dict[str, str] = {}
     css_blocks: list[str] = []
@@ -706,33 +710,38 @@ async def generate_code(
         code_tree = _build_code_ready_tree(layout.root, layout.state_name)
         component_name = _pascal_case(layout.state_name)
 
-        try:
-            component_jsx, styles_css = await _generate_component_and_styles(
-                code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
-            )
-            if component_jsx.lstrip().startswith('{') or "import React" not in component_jsx:
-                logger.warning(f"{component_name}: LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
-                component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
-        except Exception as e:
-            logger.warning(f"{component_name}: LLM generation failed ({e}); falling back to deterministic Python renderer.")
+        if fast_mode:
             component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
+        else:
+            try:
+                component_jsx, styles_css = await _generate_component_and_styles(
+                    code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
+                )
+                if component_jsx.lstrip().startswith('{') or "import React" not in component_jsx:
+                    logger.warning(f"{component_name}: LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
+                    component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
+            except Exception as e:
+                logger.warning(f"{component_name}: LLM generation failed ({e}); falling back to deterministic Python renderer.")
+                component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
 
         files[f"{component_name}.jsx"] = component_jsx
         css_blocks.append(styles_css)
 
         if layout.is_3d_scene:
             any_3d = True
-            try:
-                scene3d_jsx = await _generate_scene3d(
-                    code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
-                )
-                if scene3d_jsx.lstrip().startswith('{') or "import React" not in scene3d_jsx:
-                    logger.warning(f"{component_name}: 3D LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
-                    scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
-            except Exception as e:
-                logger.warning(f"{component_name}: 3D LLM generation failed ({e}); falling back to deterministic Python renderer.")
+            if fast_mode:
                 scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
-            
+            else:
+                try:
+                    scene3d_jsx = await _generate_scene3d(
+                        code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
+                    )
+                    if scene3d_jsx.lstrip().startswith('{') or "import React" not in scene3d_jsx:
+                        logger.warning(f"{component_name}: 3D LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
+                        scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
+                except Exception as e:
+                    logger.warning(f"{component_name}: 3D LLM generation failed ({e}); falling back to deterministic Python renderer.")
+                    scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
             files[f"Scene3D_{component_name}.jsx"] = scene3d_jsx
 
         logger.info(f"Module D: generated {component_name} ({len(code_tree['children'])} top-level child node(s))")

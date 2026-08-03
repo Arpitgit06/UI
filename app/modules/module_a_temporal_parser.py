@@ -139,8 +139,8 @@ def _classify_action(
 def _extract_key_states_sync(
     video_path: str,
     output_dir: Path,
-    ssim_change_threshold: float = 0.02,
-    stability_ssim_threshold: float = 0.99,
+    ssim_change_threshold: float = 0.01,
+    stability_ssim_threshold: float = 0.95,
     ssim_proxy_width: int = 480,
     frame_stride: int = 1,
     motion_diff_threshold: int = 25,

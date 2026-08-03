@@ -11,16 +11,17 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-# CRITICAL: These env vars MUST be set before `import paddle` to prevent
-# PaddlePaddle from loading CUDA/cuDNN DLLs at import time. Setting them
-# after import is too late and causes WinError 127 on Windows when
-# paddlepaddle-gpu is installed alongside PyTorch with a different CUDA version.
+# WINDOWS DLL CONFLICT FIX: PaddleOCR -> paddlex -> modelscope transitively
+# imports torch. If paddle's C++ runtime loads first, it blocks torch's shm.dll
+# (WinError 127). We must (1) register torch's DLL directory and (2) import torch
+# BEFORE any paddle code runs.
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["USE_GPU"] = "0"
 os.environ["FLAGS_use_gpu"] = "0"
 os.environ["FLAGS_enable_pir_in_executor"] = "0"
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "1"
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "1"
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() or 4)
 
 # WINDOWS DLL CONFLICT FIX: PaddleOCR -> paddlex -> modelscope transitively
 # imports torch. If paddle's C++ runtime loads first, it blocks torch's shm.dll
@@ -139,26 +140,29 @@ def main() -> None:
                     lang=lang,
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
-                    use_textline_orientation=True,
+                    use_textline_orientation=False,
+                    use_mkldnn=True,
                     device="cpu",
                 )
             
             all_ocr_detections = []
-            for img_path in image_paths:
+            total_images = len(image_paths)
+            for i, img_path in enumerate(image_paths):
                 ocr_raw = ocr.predict(img_path)
                 ocr_detections = []
                 for res in ocr_raw:
                     ocr_detections.extend(_parse_paddleocr_result(res))
                 ocr_detections = [d for d in ocr_detections if d.get("confidence", 0.0) >= confidence_threshold]
                 all_ocr_detections.append(ocr_detections)
+                
+                print(f"__OCR_PROGRESS__{i+1}/{total_images}__\n", flush=True)
 
             response = {"status": "success", "detections": all_ocr_detections}
             print("__OCR_JSON_START__\n" + json.dumps(response) + "\n__OCR_JSON_END__", flush=True)
 
     except Exception as e:
-        print(f"PaddleOCR Subprocess Error: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
+        response = {"status": "error", "message": str(e)}
+        print("__OCR_JSON_START__\n" + json.dumps(response) + "\n__OCR_JSON_END__", flush=True)
         sys.exit(1)
 
 

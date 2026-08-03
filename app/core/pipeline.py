@@ -38,19 +38,21 @@ async def run_pipeline(job: Job) -> None:
         detail += " / Depth-Anything-V2"
     _advance(job, JobStatus.DETECTING_ELEMENTS, detail, 20.0)
     detections_by_state = await module_b.analyze_states(key_states, enable_3d=job.enable_3d)
+
+    # Vision LLM Fallback
     fallback_indices = []
     for i, (state, detections) in enumerate(zip(key_states, detections_by_state)):
         if len([d for d in detections if d.element_type != "text"]) == 0:
             logger.info(f"Fallback: YOLO found no UI elements for {state.image_path}, queueing for Vision LLM.")
             fallback_indices.append(i)
 
-    if fallback_indices:
+    if fallback_indices and not job.fast_mode:
         _advance(job, JobStatus.DETECTING_ELEMENTS, "running Vision LLM fallback", 40.0)
         fallback_states = [key_states[i] for i in fallback_indices]
         fallback_detections_list = await module_b_fallback.analyze_states_fallback(fallback_states)
         for i, fallback_detections in zip(fallback_indices, fallback_detections_list):
             detections_by_state[i] = fallback_detections
-
+            
     _advance(job, JobStatus.SYNTHESIZING_DOM, "building parent-child layout tree", 50.0)
     layouts_dir = settings.jobs_dir / job.job_id / "layouts"
     layouts = [
@@ -58,8 +60,8 @@ async def run_pipeline(job: Job) -> None:
         for state, detections in zip(key_states, detections_by_state)
     ]
 
-    _advance(job, JobStatus.GENERATING_CODE, "running local 7B LLM code generation", 60.0)
-    generated_files = await module_d.generate_code(layouts)
+    _advance(job, JobStatus.GENERATING_CODE, "running code generation", 60.0)
+    generated_files = await module_d.generate_code(layouts, fast_mode=job.fast_mode)
 
     _advance(job, JobStatus.PACKAGING, "zipping project output", 95.0)
     zip_path = await module_d.package_output(job.job_id, generated_files)

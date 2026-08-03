@@ -47,6 +47,21 @@ wires up the real inference and VRAM-gate plumbing regardless, so
 swapping in that checkpoint later is a one-line config change, not a
 rewrite.
 """
+import json
+import os
+import sys
+
+# Inject PyTorch's bundled CUDA/cuDNN DLLs into the Windows DLL search path and PATH.
+# This allows onnxruntime-gpu to find `cudart64_12.dll` and `cudnn64_*.dll` without
+# forcing the user to install the massive 3GB system-wide NVIDIA CUDA Toolkit.
+_torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+if os.path.isdir(_torch_lib):
+    os.environ["PATH"] = _torch_lib + os.pathsep + os.environ.get("PATH", "")
+    try:
+        os.add_dll_directory(_torch_lib)
+    except (OSError, AttributeError):
+        pass
+
 import asyncio
 from typing import Optional
 
@@ -237,7 +252,7 @@ def _cuda_is_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _load_yolo(weights_path: str, device: str):
+def _load_and_export_yolo(weights_path: str, device: str, export_onnx: bool):
     from pathlib import Path
     from ultralytics import YOLO, settings as ul_settings
 
@@ -245,19 +260,32 @@ def _load_yolo(weights_path: str, device: str):
     models_cache_dir = project_root / "models_cache"
     models_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Force ultralytics to use models_cache as its weights directory
     try:
         ul_settings.update({"weights_dir": str(models_cache_dir)})
     except Exception:
         pass
 
-    # Ensure weights_path resolves strictly to the cached file in models_cache if present
     target_path = Path(weights_path)
     if not target_path.is_absolute() or not target_path.exists():
         cached_pt = models_cache_dir / target_path.name
         if cached_pt.exists():
             weights_path = str(cached_pt)
+            
+    # Auto-export to ONNX for 3x-5x speedup if requested
+    if export_onnx:
+        onnx_path = Path(weights_path).with_suffix(".onnx")
+        if not onnx_path.exists() and Path(weights_path).exists():
+            logger.info(f"Exporting {weights_path} to ONNX format...")
+            try:
+                model = YOLO(weights_path)
+                model.export(format="onnx")
+            except Exception as e:
+                logger.warning(f"Failed to export ONNX: {e}. Falling back to PyTorch.")
+        if onnx_path.exists():
+            logger.info(f"Loading ONNX engine: {onnx_path}")
+            return YOLO(str(onnx_path), task="detect")
 
+    logger.info(f"Loading PyTorch engine: {weights_path}")
     return YOLO(weights_path).to(device)
 
 
@@ -319,7 +347,7 @@ class PersistentOCRWorker:
                 [sys.executable, "-m", "app.modules.ocr_subprocess_worker"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
                 bufsize=1
             )
@@ -344,9 +372,15 @@ class PersistentOCRWorker:
             while True:
                 line = self.process.stdout.readline()
                 if not line:
-                    logger.error(f"OCR Subprocess died. Stderr: {self.process.stderr.read()}")
+                    logger.error("OCR Subprocess died unexpectedly.")
                     self.process = None
                     return [[] for _ in image_paths]
+                
+                if "__OCR_PROGRESS__" in line:
+                    prog = line.split("__OCR_PROGRESS__")[1].split("__")[0].strip()
+                    logger.info(f"PaddleOCR progress: {prog} frames...")
+                    continue
+
                 output += line
                 if "__OCR_JSON_END__" in output:
                     break
@@ -375,6 +409,13 @@ class PersistentOCRWorker:
 _global_ocr_worker = PersistentOCRWorker()
 
 
+def _unload_yolo(m):
+    try:
+        if hasattr(m, "to"):
+            m.to("cpu")
+    except Exception:
+        pass
+
 def _analyze_states_sync(
     states: list[KeyStateFrame],
     yolo_weights_path: Optional[str] = None,
@@ -389,7 +430,9 @@ def _analyze_states_sync(
     if not states:
         return []
 
-    yolo_weights_path = yolo_weights_path or settings.yolo_weights_path
+    yolo_macro_weights_path = settings.yolo_macro_weights_path
+    yolo_micro_weights_path = settings.yolo_micro_weights_path
+    yolo_export_onnx = settings.yolo_export_onnx
     yolo_confidence_threshold = (
         settings.yolo_confidence_threshold if yolo_confidence_threshold is None else yolo_confidence_threshold
     )
@@ -410,18 +453,72 @@ def _analyze_states_sync(
     images = [Image.open(state.image_path).convert("RGB") for state in states]
     guard = GPUPipelineGuard(device_index=cuda_device_index)
 
-    logger.info("Starting YOLO stage...")
+    logger.info("Starting Hybrid YOLO (Macro + Micro) stage...")
+    image_paths = [state.image_path for state in states]
+    
+    yolo_detections_list = [[] for _ in states]
+    
+    # Pass 1: YOLOv8 Macro-detector (Containers)
     with guard.stage(
-        "yolov10",
-        loader=lambda: _load_yolo(yolo_weights_path, torch_device),
-        unloader=lambda m: m.to("cpu"),
+        "yolov8_macro",
+        loader=lambda: _load_and_export_yolo(yolo_macro_weights_path, torch_device, yolo_export_onnx),
+        unloader=_unload_yolo,
         min_free_mb=1024,
-    ) as model:
-        logger.info(f"YOLO loaded. Running predict in batch on {len(states)} images...")
-        image_paths = [state.image_path for state in states]
-        results = model.predict(image_paths, conf=yolo_confidence_threshold, verbose=False)
-        yolo_detections_list = [_parse_yolo_boxes(res.boxes, res.names) for res in results]
-        logger.info("YOLO stage complete.")
+    ) as macro_model:
+        logger.info(f"YOLO Macro loaded. Running predict on {len(states)} images...")
+        macro_results = [macro_model.predict(path, conf=yolo_confidence_threshold, verbose=False)[0] for path in image_paths]
+        for i, res in enumerate(macro_results):
+            boxes = _parse_yolo_boxes(res.boxes, res.names)
+            # Add a tag to distinguish macro vs micro detections
+            for box in boxes:
+                box["level"] = "macro"
+            yolo_detections_list[i].extend(boxes)
+            
+    # Pass 2: YOLOv10 Micro-detector (Dense Elements) on Cropped Containers
+    with guard.stage(
+        "yolov10_micro",
+        loader=lambda: _load_and_export_yolo(yolo_micro_weights_path, torch_device, yolo_export_onnx),
+        unloader=_unload_yolo,
+        min_free_mb=1024,
+    ) as micro_model:
+        logger.info("YOLO Micro loaded. Processing nested crops...")
+        for i, (state, image) in enumerate(zip(states, images)):
+            macro_boxes = [d for d in yolo_detections_list[i] if d["level"] == "macro"]
+            
+            # If no macro containers found, process the full image anyway as a fallback
+            if not macro_boxes:
+                logger.info(f"No macro containers in {state.image_path}. Running micro on full image.")
+                micro_res = micro_model.predict(state.image_path, conf=yolo_confidence_threshold, verbose=False)[0]
+                micro_boxes = _parse_yolo_boxes(micro_res.boxes, micro_res.names)
+                for mb in micro_boxes:
+                    mb["level"] = "micro"
+                yolo_detections_list[i].extend(micro_boxes)
+                continue
+                
+            # Crop each macro container and run micro detection
+            crops = []
+            offsets = []
+            for m_box in macro_boxes:
+                x, y, w, h = m_box["bbox"]
+                crop = image.crop((int(x), int(y), int(x + w), int(y + h)))
+                crops.append(crop)
+                offsets.append((x, y))
+                
+            if crops:
+                logger.info(f"Running micro detector on {len(crops)} crops for {state.image_path}...")
+                micro_results = [micro_model.predict(crop, conf=yolo_confidence_threshold, verbose=False)[0] for crop in crops]
+                for crop_idx, m_res in enumerate(micro_results):
+                    offset_x, offset_y = offsets[crop_idx]
+                    local_boxes = _parse_yolo_boxes(m_res.boxes, m_res.names)
+                    
+                    # Global Re-projection
+                    for local_box in local_boxes:
+                        lx, ly, lw, lh = local_box["bbox"]
+                        local_box["bbox"] = (lx + offset_x, ly + offset_y, lw, lh)
+                        local_box["level"] = "micro"
+                        yolo_detections_list[i].append(local_box)
+                        
+    logger.info("Hybrid YOLO stage complete.")
 
     logger.info("Starting PaddleOCR stage...")
     with guard.stage(
@@ -481,7 +578,7 @@ def _analyze_states_sync(
                 DetectedElement(
                     element_id=f"{item['kind']}-{idx:03d}",
                     element_type="text" if is_text else item["label"],
-                    bbox=BoundingBox(x=x, y=y, width=w, height=h, z_index=round(z, 2)),
+                    bbox=BoundingBox(x=x, y=y, width=w, height=h, z_index=round(z, 2) if z is not None else None),
                     text_content=item["text"] if is_text else None,
                     hex_colors=hex_colors,
                     confidence=round(item["confidence"], 4),

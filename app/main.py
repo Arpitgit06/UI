@@ -103,7 +103,8 @@ async def health() -> dict:
 @app.post("/jobs", response_model=Job)
 async def create_job(
     video: UploadFile = File(...),
-    enable_3d: bool = Form(False)
+    enable_3d: bool = Form(False),
+    fast_mode: bool = Form(False)
 ) -> Job:
     if video.content_type not in ACCEPTED_VIDEO_TYPES:
         raise HTTPException(415, f"Unsupported content type: {video.content_type}")
@@ -120,10 +121,11 @@ async def create_job(
         updated_at=now,
         source_video_path=str(dest_path),
         enable_3d=enable_3d,
+        fast_mode=fast_mode,
     )
     job_queue.register(job)
     await job_queue.enqueue(job_id)
-    logger.info(f"Job {job_id} queued ({video.filename}, {dest_path.stat().st_size} bytes, 3d={enable_3d})")
+    logger.info(f"Job {job_id} queued ({video.filename}, {dest_path.stat().st_size} bytes, 3d={enable_3d}, fast_mode={fast_mode})")
     return job
 
 
