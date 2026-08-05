@@ -237,22 +237,35 @@ def _deduplicate(elements: list[DetectedElement]) -> list[DetectedElement]:
 # ---------------------------------------------------------------------------
 
 
-def _detect_3d_scene(detections: list[DetectedElement]) -> bool:
+def _detect_3d_scene(
+    detections: list[DetectedElement],
+    raw_depth_variance: Optional[float] = None,
+) -> bool:
     """
-    Detects whether a scene likely requires 3D Three.js / R3F reconstruction by checking
-    element taxonomy labels (canvas, 3d_view, mesh, webgl) or significant depth separation
-    across detected UI components.
+    Detects whether a scene likely requires 3D Three.js / R3F reconstruction by checking:
+    1. Element taxonomy labels from Vision LLM (canvas, 3d_view, mesh, webgl)
+    2. Significant z-index spread across detected elements (>= 65 on normalized 0-100 scale)
+    3. Raw pre-normalization depth variance (if available from Module B)
     """
     if not detections:
         return False
+    
+    # Check Vision LLM-assigned element types for 3D indicators
     for el in detections:
         if el.element_type:
             et = el.element_type.lower()
-            if any(k in et for k in ("3d", "canvas", "webgl", "mesh", "model")):
+            if any(k in et for k in ("3d", "canvas", "webgl", "mesh", "model", "scene", "viewport", "orbit")):
                 return True
+    
+    # Check raw depth variance (pre-normalization) — most reliable signal
+    if raw_depth_variance is not None and raw_depth_variance > 500.0:
+        return True
+    
+    # Check normalized z-index spread (less reliable due to normalization stretching)
     z_vals = [el.bbox.z_index for el in detections if el.bbox.z_index is not None]
     if len(z_vals) >= 3 and (max(z_vals) - min(z_vals)) >= 65.0:
         return True
+    
     return False
 
 
@@ -261,6 +274,8 @@ def _synthesize_dom_sync(
     detections: list[DetectedElement],
     containment_threshold: Optional[float] = None,
     is_3d_scene: Optional[bool] = None,
+    vision_verifier_approved: bool = False,
+    raw_depth_variance: Optional[float] = None,
 ) -> LayoutState:
     containment_threshold = (
         settings.dom_containment_threshold if containment_threshold is None else containment_threshold
@@ -275,11 +290,18 @@ def _synthesize_dom_sync(
         _build_tree(detections, parent_of, root)
 
     if is_3d_scene is None:
-        is_3d_scene = _detect_3d_scene(detections)
+        is_3d_scene = _detect_3d_scene(detections, raw_depth_variance)
 
     logger.info(f"Module C: {state.image_path} -> {len(detections)} element(s) nested under root (is_3d={is_3d_scene})")
 
-    return LayoutState(state_name=f"state_{state.frame_index}", source_frame=state, root=root, is_3d_scene=is_3d_scene)
+    return LayoutState(
+        state_name=f"state_{state.frame_index}",
+        source_frame=state,
+        root=root,
+        is_3d_scene=is_3d_scene,
+        vision_verifier_approved=vision_verifier_approved,
+        raw_depth_variance=raw_depth_variance,
+    )
 
 
 def write_layout_json(layout_state: LayoutState, output_dir: Path) -> Path:
@@ -297,6 +319,8 @@ async def synthesize_dom(
     output_dir: Optional[Path] = None,
     containment_threshold: Optional[float] = None,
     is_3d_scene: Optional[bool] = None,
+    vision_verifier_approved: bool = False,
+    raw_depth_variance: Optional[float] = None,
 ) -> LayoutState:
     """
     Builds the tree in a worker thread (consistent with the rest of the
@@ -305,9 +329,13 @@ async def synthesize_dom(
     """
 
     def _run() -> LayoutState:
-        layout_state = _synthesize_dom_sync(state, detections, containment_threshold, is_3d_scene)
+        layout_state = _synthesize_dom_sync(
+            state, detections, containment_threshold, is_3d_scene,
+            vision_verifier_approved, raw_depth_variance,
+        )
         if output_dir is not None:
             write_layout_json(layout_state, output_dir)
         return layout_state
 
     return await asyncio.to_thread(_run)
+

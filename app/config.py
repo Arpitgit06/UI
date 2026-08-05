@@ -65,7 +65,8 @@ class Settings:
             "OMNIUI_YOLO_MICRO_WEIGHTS",
             str(self.models_cache_dir / "yolov10_micro.pt"),
         )
-        self.yolo_export_onnx = os.environ.get("OMNIUI_YOLO_EXPORT_ONNX", "false").lower() == "true"
+        self.yolo_export_onnx = os.environ.get("OMNIUI_YOLO_EXPORT_ONNX", "true").lower() == "true"
+        self.yolo_on_cpu = os.environ.get("OMNIUI_YOLO_ON_CPU", "true").lower() == "true"
         
         self.yolo_confidence_threshold = float(os.environ.get("OMNIUI_YOLO_CONF", 0.25))
         self.paddleocr_lang = os.environ.get("OMNIUI_OCR_LANG", "en")
@@ -84,6 +85,7 @@ class Settings:
         # Local LLM (Module D) — loaded directly via Hugging Face / transformers
         self.local_llm_model_name = os.environ.get("OMNIUI_LLM_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
         self.vision_llm_model_name = os.environ.get("OMNIUI_VISION_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
+        self.vision_detector_model_name = os.environ.get("OMNIUI_VISION_DETECTOR_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
         self.local_llm_load_in_4bit = os.environ.get("OMNIUI_LLM_4BIT", "true").lower() == "true"
         self.local_llm_temperature = float(os.environ.get("OMNIUI_LLM_TEMPERATURE", 0.1))
         self.local_llm_max_new_tokens = int(os.environ.get("OMNIUI_LLM_MAX_TOKENS", 4096))

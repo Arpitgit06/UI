@@ -1,7 +1,11 @@
 """
-Coordinates the full Module A -> B -> C -> D execution flow for a
+Coordinates the full Module A → B → C → D execution flow for a
 single job. Deliberately thin: all the actual logic lives in
 app/modules/*.
+
+v2: Hybrid parallel pipeline. YOLO + Vision LLM 3B + Vision LLM 7B
+    run in Module B regardless of fast_mode. Only Module D differs
+    between fast and LLM modes.
 """
 from datetime import datetime, timezone
 
@@ -10,9 +14,9 @@ from app.models.schemas import Job, JobStatus
 from app.modules import (
     module_a_temporal_parser as module_a,
     module_b_spatial_vision as module_b,
-    module_b_vision_llm as module_b_fallback,
     module_c_dom_synthesizer as module_c,
     module_d_code_generator as module_d,
+    verification as verify,
 )
 from app.utils.logger import get_logger
 
@@ -28,44 +32,72 @@ def _advance(job: Job, status: JobStatus, detail: str = "", progress: float = 0.
 
 
 async def run_pipeline(job: Job) -> None:
+    # -----------------------------------------------------------------------
+    # Module A: Temporal Parsing
+    # -----------------------------------------------------------------------
     _advance(job, JobStatus.PARSING_VIDEO, "extracting key state frames via SSIM diffing", 5.0)
     key_states_dir = settings.jobs_dir / job.job_id / "key_states"
     key_states = await module_a.extract_key_states(job.source_video_path, key_states_dir)
     job.key_states_detected = len(key_states)
+    logger.info(f"Module A: {len(key_states)} key states extracted")
 
-    detail = "running YOLOv10 / PaddleOCR"
-    if job.enable_3d:
-        detail += " / Depth-Anything-V2"
-    _advance(job, JobStatus.DETECTING_ELEMENTS, detail, 20.0)
-    detections_by_state = await module_b.analyze_states(key_states, enable_3d=job.enable_3d)
+    # -----------------------------------------------------------------------
+    # Module B: Hybrid Parallel Detection
+    # YOLO (CPU) + Vision LLM 3B (detector) + Vision LLM 7B (verifier)
+    # + PaddleOCR + Colorgram + Depth — runs IDENTICALLY in fast & LLM mode
+    # -----------------------------------------------------------------------
+    _advance(
+        job, JobStatus.DETECTING_ELEMENTS,
+        "YOLO (CPU) + Vision LLM 3B detector + 7B verifier + PaddleOCR + Depth",
+        20.0,
+    )
+    detections_by_state, approval_flags = await module_b.analyze_states(
+        key_states, enable_3d=True  # always run depth for z-ordering
+    )
 
-    # Vision LLM Fallback
-    fallback_indices = []
-    for i, (state, detections) in enumerate(zip(key_states, detections_by_state)):
-        if len([d for d in detections if d.element_type != "text"]) == 0:
-            logger.info(f"Fallback: YOLO found no UI elements for {state.image_path}, queueing for Vision LLM.")
-            fallback_indices.append(i)
-
-    if fallback_indices and not job.fast_mode:
-        _advance(job, JobStatus.DETECTING_ELEMENTS, "running Vision LLM fallback", 40.0)
-        fallback_states = [key_states[i] for i in fallback_indices]
-        fallback_detections_list = await module_b_fallback.analyze_states_fallback(fallback_states)
-        for i, fallback_detections in zip(fallback_indices, fallback_detections_list):
-            detections_by_state[i] = fallback_detections
-            
+    # -----------------------------------------------------------------------
+    # Module C: DOM Synthesis
+    # is_3d_scene: if user explicitly enabled 3D → force True
+    #              otherwise → None (let Module C auto-detect)
+    # -----------------------------------------------------------------------
     _advance(job, JobStatus.SYNTHESIZING_DOM, "building parent-child layout tree", 50.0)
     layouts_dir = settings.jobs_dir / job.job_id / "layouts"
-    layouts = [
-        await module_c.synthesize_dom(state, detections, layouts_dir, is_3d_scene=job.enable_3d)
-        for state, detections in zip(key_states, detections_by_state)
-    ]
+    layouts = []
+    for i, (state, detections) in enumerate(zip(key_states, detections_by_state)):
+        is_3d = True if job.enable_3d else None  # None = auto-detect
+        approved = approval_flags[i] if i < len(approval_flags) else False
+        
+        # Get raw depth variance from the first detection (all detections in a state share it)
+        raw_depth_var = None
+        if detections:
+            raw_depth_var = detections[0].raw_depth_range  # stored per-element but same per-state
+        
+        layout = await module_c.synthesize_dom(
+            state, detections, layouts_dir,
+            is_3d_scene=is_3d,
+            vision_verifier_approved=approved,
+            raw_depth_variance=raw_depth_var,
+        )
+        layouts.append(layout)
 
+    # -----------------------------------------------------------------------
+    # Module D: Code Generation
+    # THIS is where fast_mode matters: deterministic Python vs. LLM
+    # -----------------------------------------------------------------------
     _advance(job, JobStatus.GENERATING_CODE, "running code generation", 60.0)
     generated_files = await module_d.generate_code(layouts, fast_mode=job.fast_mode)
 
+    # Build verification report
+    detected_counts = [len(dets) for dets in detections_by_state]
+    generated_files["verification_report.json"] = verify.build_verification_report(
+        layouts, detected_counts
+    )
+
+    # -----------------------------------------------------------------------
+    # Packaging
+    # -----------------------------------------------------------------------
     _advance(job, JobStatus.PACKAGING, "zipping project output", 95.0)
     zip_path = await module_d.package_output(job.job_id, generated_files)
 
     job.output_zip_path = str(zip_path)
     _advance(job, JobStatus.COMPLETE, "done", 100.0)
-

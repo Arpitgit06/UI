@@ -46,6 +46,21 @@ by testing against synthetic frames/videos, not assumed):
      cursor sprite is even visible in the recording. Treat
      inferred_action and cursor_position as a best-effort heuristic to
      be retuned against real recordings, not ground truth.
+
+  5. Ambient motion detection (v2): regions of the frame that keep
+     changing for a large fraction of the clip duration (e.g. rotating
+     rings, pulsing animations, floating particles) are detected by
+     tracking per-grid-cell instability over time. If a cell fails the
+     stability check for >60% of the clip, it's flagged as "ambient
+     motion" and changes in that region are ignored for key-state
+     decisions. These regions are reported so Module D can express them
+     as CSS @keyframes or R3F animations rather than emitting one
+     StateN.jsx per frame of the loop.
+
+  6. Post-capture deduplication: after all key states are extracted,
+     a final pass merges states whose SSIM > 0.97 (near-identical
+     frames that slipped through, typically from small sub-threshold
+     ambient drift). This is a safety net, not the primary filter.
 """
 import asyncio
 from dataclasses import dataclass
@@ -136,6 +151,155 @@ def _classify_action(
     return position, "hover"
 
 
+# ---------------------------------------------------------------------------
+# Ambient motion detection — grid-based regional instability tracking
+# ---------------------------------------------------------------------------
+
+
+def _build_instability_grid(
+    prev_gray: np.ndarray,
+    curr_gray: np.ndarray,
+    grid_rows: int,
+    grid_cols: int,
+    cell_change_threshold: float = 15.0,
+) -> np.ndarray:
+    """
+    Returns a boolean grid (grid_rows x grid_cols) where True means the
+    cell changed between prev and curr frames (mean absolute diff exceeds
+    threshold).
+    """
+    h, w = prev_gray.shape[:2]
+    cell_h = h // grid_rows
+    cell_w = w // grid_cols
+    changed = np.zeros((grid_rows, grid_cols), dtype=bool)
+    
+    diff = cv2.absdiff(prev_gray, curr_gray).astype(np.float32)
+    
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            y1 = r * cell_h
+            y2 = (r + 1) * cell_h if r < grid_rows - 1 else h
+            x1 = c * cell_w
+            x2 = (c + 1) * cell_w if c < grid_cols - 1 else w
+            cell_mean = diff[y1:y2, x1:x2].mean()
+            changed[r, c] = cell_mean > cell_change_threshold
+    
+    return changed
+
+
+def _detect_ambient_regions(
+    instability_counts: np.ndarray,
+    total_comparisons: int,
+    grid_rows: int,
+    grid_cols: int,
+    frame_h: int,
+    frame_w: int,
+    ambient_threshold_fraction: float = 0.6,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Returns bounding boxes (x, y, w, h) in pixel coordinates for grid
+    cells that were unstable for more than ambient_threshold_fraction of
+    the clip's frame comparisons.
+    """
+    if total_comparisons < 1:
+        return []
+    
+    cell_h = frame_h / grid_rows
+    cell_w = frame_w / grid_cols
+    regions: list[tuple[float, float, float, float]] = []
+    
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            fraction = instability_counts[r, c] / total_comparisons
+            if fraction >= ambient_threshold_fraction:
+                x = c * cell_w
+                y = r * cell_h
+                regions.append((x, y, cell_w, cell_h))
+    
+    return regions
+
+
+def _is_in_ambient_region(
+    proxy: np.ndarray,
+    reference_proxy: np.ndarray,
+    ambient_mask: np.ndarray,
+    grid_rows: int,
+    grid_cols: int,
+    ssim_change_threshold: float,
+) -> bool:
+    """
+    Check if the change between proxy and reference is ONLY in ambient
+    motion regions. If all changed cells are ambient, don't capture.
+    Returns True if the change is entirely ambient (should NOT capture).
+    """
+    if not ambient_mask.any():
+        return False  # no ambient regions detected yet
+    
+    h, w = proxy.shape[:2]
+    cell_h = h // grid_rows
+    cell_w = w // grid_cols
+    
+    diff = cv2.absdiff(proxy.astype(np.float32), reference_proxy.astype(np.float32))
+    
+    has_non_ambient_change = False
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            if ambient_mask[r, c]:
+                continue  # skip ambient cells
+            y1 = r * cell_h
+            y2 = (r + 1) * cell_h if r < grid_rows - 1 else h
+            x1 = c * cell_w
+            x2 = (c + 1) * cell_w if c < grid_cols - 1 else w
+            cell_mean = diff[y1:y2, x1:x2].mean()
+            if cell_mean > 5.0:  # non-trivial change in a non-ambient cell
+                has_non_ambient_change = True
+                break
+        if has_non_ambient_change:
+            break
+    
+    return not has_non_ambient_change
+
+
+# ---------------------------------------------------------------------------
+# Post-capture deduplication
+# ---------------------------------------------------------------------------
+
+
+def _deduplicate_states(
+    key_states: list[KeyStateFrame],
+    dedup_ssim_threshold: float = 0.97,
+    ssim_proxy_width: int = 480,
+) -> list[KeyStateFrame]:
+    """
+    Merge near-identical states that slipped through the primary filter
+    (typically from small sub-threshold ambient drift). Keeps the first
+    occurrence of each visually-distinct group.
+    """
+    if len(key_states) <= 1:
+        return key_states
+
+    unique: list[KeyStateFrame] = [key_states[0]]
+    prev_proxy = _downscale(cv2.imread(key_states[0].image_path), ssim_proxy_width)
+
+    for state in key_states[1:]:
+        curr_proxy = _downscale(cv2.imread(state.image_path), ssim_proxy_width)
+        try:
+            score = ssim(prev_proxy, curr_proxy, channel_axis=-1, data_range=255)
+        except Exception:
+            score = 0.0  # treat unreadable as different
+
+        if score < dedup_ssim_threshold:
+            unique.append(state)
+            prev_proxy = curr_proxy
+        else:
+            logger.debug(f"Dedup: dropping {state.image_path} (ssim={score:.4f} with previous)")
+
+    if len(unique) < len(key_states):
+        logger.info(f"Deduplication: {len(key_states)} → {len(unique)} states (threshold={dedup_ssim_threshold})")
+
+    return unique
+
+
 def _extract_key_states_sync(
     video_path: str,
     output_dir: Path,
@@ -148,7 +312,11 @@ def _extract_key_states_sync(
     motion_max_area_fraction: float = 0.6,
     drag_distance_px: float = 40.0,
     click_max_duration_sec: float = 0.35,
-    max_key_states: int = 200,
+    max_key_states: int = 30,
+    ambient_grid_rows: int = 4,
+    ambient_grid_cols: int = 4,
+    ambient_threshold_fraction: float = 0.6,
+    dedup_ssim_threshold: float = 0.97,
 ) -> list[KeyStateFrame]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -161,12 +329,19 @@ def _extract_key_states_sync(
         )
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     key_states: list[KeyStateFrame] = []
     reference_proxy: Optional[np.ndarray] = None  # proxy of the last CAPTURED key state
     prev_frame_proxy: Optional[np.ndarray] = None  # proxy of the immediately preceding raw frame
     prev_gray: Optional[np.ndarray] = None
     motion_since_last_capture: list[_MotionSample] = []
     raw_index = -1
+
+    # Ambient motion tracking: count how many frame-comparisons each grid cell was unstable
+    instability_counts = np.zeros((ambient_grid_rows, ambient_grid_cols), dtype=np.int32)
+    total_comparisons = 0
+    ambient_mask = np.zeros((ambient_grid_rows, ambient_grid_cols), dtype=bool)
+    frame_h, frame_w = 0, 0
 
     try:
         while True:
@@ -179,6 +354,26 @@ def _extract_key_states_sync(
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             proxy = _downscale(frame, ssim_proxy_width)
+            
+            if frame_h == 0:
+                frame_h, frame_w = frame.shape[:2]
+
+            # Track regional instability for ambient motion detection
+            if prev_gray is not None:
+                grid_changed = _build_instability_grid(
+                    _downscale(prev_gray.reshape(prev_gray.shape[0], prev_gray.shape[1]), ssim_proxy_width // 2) 
+                    if len(prev_gray.shape) == 2 else prev_gray,
+                    _downscale(gray.reshape(gray.shape[0], gray.shape[1]), ssim_proxy_width // 2)
+                    if len(gray.shape) == 2 else gray,
+                    ambient_grid_rows,
+                    ambient_grid_cols,
+                )
+                instability_counts += grid_changed.astype(np.int32)
+                total_comparisons += 1
+                
+                # Update ambient mask periodically (every 30 comparisons or at 20% of clip)
+                if total_comparisons > 0 and total_comparisons % 30 == 0:
+                    ambient_mask = (instability_counts / total_comparisons) >= ambient_threshold_fraction
 
             if prev_gray is not None:
                 sample = _motion_centroid(
@@ -196,6 +391,16 @@ def _extract_key_states_sync(
                 if is_stable_now:
                     change_score = ssim(reference_proxy, proxy, channel_axis=-1, data_range=255)
                     should_capture = (1.0 - change_score) > ssim_change_threshold
+                    
+                    # Check if the change is ONLY in ambient regions — if so, don't capture
+                    if should_capture and ambient_mask.any():
+                        is_ambient_only = _is_in_ambient_region(
+                            proxy, reference_proxy, ambient_mask,
+                            ambient_grid_rows, ambient_grid_cols, ssim_change_threshold,
+                        )
+                        if is_ambient_only:
+                            should_capture = False
+                            logger.debug(f"Frame {raw_index}: change is only in ambient regions, skipping capture")
 
             if should_capture:
                 if len(key_states) >= max_key_states:
@@ -238,10 +443,25 @@ def _extract_key_states_sync(
     if not key_states:
         raise VideoReadError(f"No frames could be read from {video_path}.")
 
+    # Detect final ambient motion regions and attach to all key states
+    ambient_regions = _detect_ambient_regions(
+        instability_counts, total_comparisons,
+        ambient_grid_rows, ambient_grid_cols,
+        frame_h, frame_w, ambient_threshold_fraction,
+    )
+    if ambient_regions:
+        logger.info(f"Module A: detected {len(ambient_regions)} ambient motion region(s)")
+        for state in key_states:
+            state.ambient_motion_regions = ambient_regions
+
+    # Post-capture deduplication: merge near-identical states
+    key_states = _deduplicate_states(key_states, dedup_ssim_threshold, ssim_proxy_width)
+
     logger.info(
         f"Module A: {video_path} -> {len(key_states)} key state(s) "
         f"(fps={fps:.1f}, change_threshold={ssim_change_threshold}, "
-        f"stability_threshold={stability_ssim_threshold})"
+        f"stability_threshold={stability_ssim_threshold}, "
+        f"ambient_regions={len(ambient_regions)})"
     )
     return key_states
 

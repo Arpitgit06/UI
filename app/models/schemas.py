@@ -44,6 +44,8 @@ class DetectedElement(BaseModel):
     text_content: Optional[str] = None
     hex_colors: list[str] = Field(default_factory=list)
     confidence: float = 0.0
+    detection_source: Literal["yolo", "vision_llm", "ocr", "verifier"] = "yolo"
+    raw_depth_range: Optional[float] = None  # pre-normalization depth range for 3D scene detection
 
 
 class KeyStateFrame(BaseModel):
@@ -55,6 +57,10 @@ class KeyStateFrame(BaseModel):
     ssim_delta_from_previous: Optional[float] = None
     cursor_position: Optional[tuple[float, float]] = None
     inferred_action: Literal["hover", "click", "drag", "none"] = "none"
+    ambient_motion_regions: list[tuple[float, float, float, float]] = Field(
+        default_factory=list,
+        description="Bounding boxes (x, y, w, h) of regions with continuous ambient motion (never-settling animation)",
+    )
 
 
 class DOMNode(BaseModel):
@@ -80,6 +86,8 @@ class LayoutState(BaseModel):
     source_frame: KeyStateFrame
     root: DOMNode
     is_3d_scene: bool = False
+    vision_verifier_approved: bool = False
+    raw_depth_variance: Optional[float] = None  # pre-normalization depth variance for 3D scene detection
 
 
 class Job(BaseModel):
