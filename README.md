@@ -5,21 +5,22 @@ Local, offline video-to-UI-code pipeline. Converts a screen recording of a
 using deterministic computer vision for layout extraction — the local LLM
 is used strictly as a syntax compiler, never to guess pixel positions.
 
-## Status (iteration 5 — all four modules implemented)
+## Status (iteration 6 — hybrid parallel detection pipeline)
 
 | Piece | Status |
 |---|---|
 | Core Orchestration (FastAPI, async job queue) | ✅ implemented |
 | VRAM lifecycle manager (`vram_scope`, `GPUPipelineGuard`) | ✅ implemented |
-| A — Temporal Video Parser (OpenCV + SSIM) | ✅ implemented |
-| B — Spatial Vision & Detection (Hybrid YOLO, PaddleOCR, Depth-Anything-V2) | ✅ implemented |
-| C — DOM Synthesizer | ✅ implemented |
-| D — Local Code Generation (Hugging Face Transformers Subprocess) | ✅ implemented |
+| A — Temporal Video Parser (OpenCV + SSIM + ambient motion) | ✅ implemented |
+| B — Hybrid Parallel Detection (YOLO CPU ∥ Vision LLM 3B + 7B verifier + PaddleOCR + Depth) | ✅ implemented |
+| C — DOM Synthesizer (auto 3D detection) | ✅ implemented |
+| D — Code Generation (runnable Vite+React scaffold) | ✅ implemented |
 
-The full upload → queue → parse → detect → nest → generate → download
-pipeline is wired end-to-end. What's left is real-world tuning (a
-UI-trained YOLO checkpoint, threshold calibration against actual
-recordings) rather than missing plumbing.
+The full upload → queue → parse → detect → verify → nest → generate → download
+pipeline is wired end-to-end with a hybrid parallel detection architecture:
+YOLO runs on CPU while Vision LLM loads on GPU (free parallelism), then the
+3B detector labels YOLO boxes + finds missed elements, and the 7B verifier
+catches errors before DOM synthesis.
 
 ### Module D in detail
 
