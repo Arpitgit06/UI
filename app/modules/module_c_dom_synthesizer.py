@@ -257,8 +257,8 @@ def _detect_3d_scene(
             if any(k in et for k in ("3d", "canvas", "webgl", "mesh", "model", "scene", "viewport", "orbit")):
                 return True
     
-    # Check raw depth variance (pre-normalization) — most reliable signal
-    if raw_depth_variance is not None and raw_depth_variance > 500.0:
+    # Check raw depth range (pre-normalization) — most reliable signal
+    if raw_depth_variance is not None and raw_depth_variance > 50.0:
         return True
     
     # Check normalized z-index spread (less reliable due to normalization stretching)

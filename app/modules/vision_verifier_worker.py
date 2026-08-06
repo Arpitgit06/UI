@@ -30,25 +30,23 @@ os.environ.setdefault("TORCH_HOME", str(models_cache_dir))
 
 
 _VERIFIER_PROMPT = """\
-You are a UI detection verifier. A detection system has identified these UI elements in the screenshot:
+You are a UI detection verifier. A detection system has identified these UI elements:
 
 {detections}
 
-Your task is to VERIFY and CORRECT this detection list by comparing it against the actual screenshot:
+VERIFY and CORRECT this detection list by comparing it against the actual screenshot.
+Do NOT re-output the entire list. Only output the differences:
+1. "corrections": Elements whose type, text, or bbox need fixing. Reference them by "id".
+2. "missed_elements": New elements that were completely missed. Provide their "type", "bbox", and "text".
+3. "deleted_ids": A list of IDs of elements that are false positives and should be removed.
 
-1. MISSED ELEMENTS: Are there any clearly visible UI elements in the screenshot that are NOT in the list above? If so, add them.
-2. WRONG TYPES: Are any element types obviously wrong? (e.g., a navbar labeled as "button"). If so, correct them.
-3. WRONG TEXT: Is any text content incorrect? If so, fix it.
-4. BAD BBOXES: Are any bounding boxes wildly off from the visible element? If so, adjust them.
-5. FALSE POSITIVES: Are any detections clearly wrong (detecting something that isn't there)? If so, remove them.
+Return a JSON object with exactly these fields:
+- "approved": true if the original detections are mostly good, false if they have major issues
+- "corrections": list of objects with "id" and the fields to correct (e.g., {{"id": 2, "type": "button"}})
+- "missed_elements": list of new elements (e.g., {{"type": "icon", "bbox": [10, 10, 20, 20]}})
+- "deleted_ids": list of IDs to remove (e.g., [4, 7])
 
-Return a JSON object with exactly two fields:
-- "approved": true if the detections are good enough (minor issues are OK), false if major problems found
-- "elements": the COMPLETE corrected element list (include ALL elements — both verified originals and any new ones you added)
-
-Each element in the list must have: "type", "bbox" [x, y, width, height], "text" (or null), "confidence".
-
-Return ONLY valid JSON, no markdown fences.
+Return ONLY valid JSON.
 """
 
 
@@ -92,7 +90,7 @@ def main() -> None:
             cache_dir=str(models_cache_dir),
             local_files_only=False,
             min_pixels=256 * 28 * 28,
-            max_pixels=512 * 28 * 28,
+            max_pixels=384 * 28 * 28,  # Reduced from 512 to prevent 8GB VRAM OOM on 7B model
         )
 
         model_kwargs = {
@@ -125,15 +123,24 @@ def main() -> None:
         print("[Vision Verifier] Model loaded into VRAM.", file=sys.stderr, flush=True)
 
         results = []
-        for img_idx, img_path in enumerate(image_paths):
-            dets = detections_per_image[img_idx] if img_idx < len(detections_per_image) else []
-
-            det_summary = json.dumps(
-                [{"type": d.get("type", "unknown"), "bbox": d["bbox"], "text": d.get("text"), "confidence": d.get("confidence", 0.5)} for d in dets],
-                indent=2,
-            )
-            prompt_text = _VERIFIER_PROMPT.format(detections=det_summary)
-            prompt_text += "\nIMPORTANT: Output ONLY valid JSON object, no markdown fences."
+        for img_idx, (img_path, dets) in enumerate(zip(image_paths, detections_per_image)):
+            
+            # Add IDs, convert bboxes to int, and minify JSON to heavily reduce input tokens
+            dets_with_ids = []
+            for i, d in enumerate(dets):
+                bbox = d.get("bbox")
+                if bbox and len(bbox) == 4:
+                    bbox = [int(v) for v in bbox]
+                dets_with_ids.append({
+                    "id": i,
+                    "type": d.get("type", "div"),
+                    "bbox": bbox,
+                    "text": d.get("text")
+                })
+            dets_summary = json.dumps(dets_with_ids, separators=(',', ':'))
+            
+            prompt_text = _VERIFIER_PROMPT.format(detections=dets_summary)
+            prompt_text += "\nIMPORTANT: Output ONLY valid JSON, no markdown fences."
 
             messages = [
                 {

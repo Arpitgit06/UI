@@ -32,26 +32,20 @@ os.environ.setdefault("TORCH_HOME", str(models_cache_dir))
 
 
 _DETECTOR_PROMPT_WITH_YOLO = """\
-You are a precise UI element detector analyzing a screenshot of a user interface.
-
-A fast pre-detector has already found these bounding boxes in the image:
+You are a precise UI element detector. A fast pre-detector found these bounding boxes:
 {yolo_detections}
 
-For each pre-detected box above, determine its UI element type from this list:
-button, text, input, checkbox, radio, switch, slider, icon, image, navbar, toolbar, card, modal, drawer, list, list_item, video, canvas, container, header, footer, sidebar, tab, dropdown, tooltip, badge, avatar, progress_bar, divider, link
+Your task:
+1. Assign a UI element type (and text) to each pre-detected box by referencing its "id". Do NOT output the bbox again.
+2. Find any missed UI elements and report them with their "bbox" [x, y, w, h].
 
-Also carefully scan the entire screenshot for any ADDITIONAL UI elements that the pre-detector missed. Common things the pre-detector misses: text labels, small icons, input placeholders, navigation items, status indicators, background images, gradient overlays.
-
-For EVERY element (both pre-detected and newly found), provide:
-- "type": the UI element type from the list above
-- "bbox": bounding box as [x, y, width, height] in pixels
-- "text": any visible text content (null if none)
-- "confidence": your confidence from 0.0 to 1.0
+UI element types: button, text, input, checkbox, radio, switch, slider, icon, image, navbar, toolbar, card, modal, drawer, list, list_item, video, canvas, container, header, footer, sidebar, tab, dropdown, tooltip, badge, avatar, progress_bar, divider, link
 
 Return ONLY a JSON array. Example:
 [
-  {"type": "button", "bbox": [10, 20, 100, 40], "text": "Submit", "confidence": 0.95},
-  {"type": "text", "bbox": [120, 20, 200, 20], "text": "Hello World", "confidence": 0.99}
+  {{"id": 0, "type": "button", "text": "Submit", "confidence": 0.95}},
+  {{"id": 1, "type": "image", "text": null, "confidence": 0.90}},
+  {{"type": "icon", "bbox": [5, 5, 20, 20], "text": null, "confidence": 0.85}}
 ]
 """
 
@@ -69,8 +63,8 @@ For EVERY element found, provide:
 
 Return ONLY a JSON array. Example:
 [
-  {"type": "button", "bbox": [10, 20, 100, 40], "text": "Submit", "confidence": 0.95},
-  {"type": "text", "bbox": [120, 20, 200, 20], "text": "Hello World", "confidence": 0.99}
+  {{"type": "button", "bbox": [10, 20, 100, 40], "text": "Submit", "confidence": 0.95}},
+  {{"type": "text", "bbox": [120, 20, 200, 20], "text": "Hello World", "confidence": 0.99}}
 ]
 """
 
@@ -127,7 +121,7 @@ def main() -> None:
             cache_dir=str(models_cache_dir),
             local_files_only=False,
             min_pixels=256 * 28 * 28,
-            max_pixels=512 * 28 * 28,
+            max_pixels=384 * 28 * 28,
         )
 
         model_kwargs = {
@@ -165,7 +159,7 @@ def main() -> None:
             yolo_dets = yolo_detections_per_image[img_idx] if img_idx < len(yolo_detections_per_image) else []
             
             if yolo_dets:
-                yolo_summary = json.dumps([{"bbox": d["bbox"], "confidence": d.get("confidence", 0.5)} for d in yolo_dets], indent=2)
+                yolo_summary = json.dumps([{"id": i, "bbox": d["bbox"], "confidence": d.get("confidence", 0.5)} for i, d in enumerate(yolo_dets)], indent=2)
                 prompt_text = _DETECTOR_PROMPT_WITH_YOLO.format(yolo_detections=yolo_summary)
             else:
                 prompt_text = _DETECTOR_PROMPT_NO_YOLO

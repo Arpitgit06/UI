@@ -346,7 +346,7 @@ def _run_vision_detector(states, yolo_detections_per_state):
         "image_paths": [str(s.image_path) for s in states],
         "yolo_detections": yolo_for_prompt,
         "temperature": 0.1,
-        "max_new_tokens": 2048,
+        "max_new_tokens": 1024,
         "load_in_4bit": load_in_4bit,
     }
     
@@ -360,8 +360,39 @@ def _run_vision_detector(states, yolo_detections_per_state):
     return parsed_results
 
 
-def _run_vision_verifier(states, detections_per_state):
-    """Run the 7B Vision LLM verifier subprocess."""
+def _apply_verifier_patches(original_dets, verifier_output):
+    if not isinstance(verifier_output, dict):
+        return original_dets
+        
+    dets_by_id = {i: dict(d) for i, d in enumerate(original_dets)}
+    
+    for del_id in verifier_output.get("deleted_ids", []):
+        dets_by_id.pop(del_id, None)
+        
+    for corr in verifier_output.get("corrections", []):
+        if isinstance(corr, dict) and "id" in corr and corr["id"] in dets_by_id:
+            for k, v in corr.items():
+                if k != "id":
+                    dets_by_id[corr["id"]][k] = v
+                    
+    final_dets = list(dets_by_id.values())
+    for new_el in verifier_output.get("missed_elements", []):
+        if isinstance(new_el, dict) and "bbox" in new_el:
+            bbox = new_el["bbox"]
+            if isinstance(bbox, list) and len(bbox) == 4:
+                final_dets.append({
+                    "bbox": tuple(float(v) for v in bbox),
+                    "type": new_el.get("type", "div"),
+                    "text": new_el.get("text"),
+                    "confidence": new_el.get("confidence", 0.9),
+                    "source": "verifier",
+                })
+            
+    return final_dets
+
+
+def _run_vision_verifier(states: list, detections_per_state: list[list[dict]]) -> tuple[list[list[dict]], list[bool]]:
+    """Stage 2: Use Vision LLM 7B to verify and patch the merged detections."""
     model_name = settings.vision_llm_model_name
     load_in_4bit = settings.local_llm_load_in_4bit
     
@@ -372,33 +403,29 @@ def _run_vision_verifier(states, detections_per_state):
         "image_paths": [str(s.image_path) for s in states],
         "detections": detections_per_state,
         "temperature": 0.1,
-        "max_new_tokens": 2048,
+        "max_new_tokens": 1024,
         "load_in_4bit": load_in_4bit,
     }
-    
+        
     raw_results = _run_vision_subprocess("app.modules.vision_verifier_worker", payload)
     
-    # Parse verifier output: each result is a JSON object with "approved" and "elements"
     verified_results = []
     approval_flags = []
     
-    for res_str in raw_results:
+    for i, res_str in enumerate(raw_results):
+        original_dets = detections_per_state[i] if i < len(detections_per_state) else []
         try:
             parsed = json.loads(res_str) if isinstance(res_str, str) else res_str
             if isinstance(parsed, dict):
                 approval_flags.append(parsed.get("approved", True))
-                elements = parsed.get("elements", [])
-                verified_results.append(elements if isinstance(elements, list) else [])
-            elif isinstance(parsed, list):
-                approval_flags.append(True)
-                verified_results.append(parsed)
+                patched = _apply_verifier_patches(original_dets, parsed)
+                verified_results.append(patched)
             else:
                 approval_flags.append(True)
-                verified_results.append([])
+                verified_results.append(original_dets)
         except (json.JSONDecodeError, TypeError):
-            # Verifier response unparseable — use the pre-verification detections
             approval_flags.append(True)
-            verified_results.append([])
+            verified_results.append(original_dets)
     
     return verified_results, approval_flags
 
@@ -415,23 +442,20 @@ def _merge_detections(yolo_dets, vlm_dets, iou_threshold=0.5):
     keep YOLO's bbox precision but use VLM's semantic type and text.
     """
     merged = []
-    vlm_used = set()
     
-    for yd in yolo_dets:
-        best_vlm_idx = -1
-        best_iou = 0.0
+    # Create a map of YOLO detections by ID
+    yolo_by_id = {i: yd for i, yd in enumerate(yolo_dets)}
+    
+    # If VLM failed and didn't return a list, fallback to raw YOLO
+    if not isinstance(vlm_dets, list):
+        vlm_dets = []
         
-        for vi, vd in enumerate(vlm_dets):
-            if vi in vlm_used:
-                continue
-            score = _iou(yd["bbox"], vd.get("bbox", [0, 0, 0, 0]))
-            if score > best_iou:
-                best_iou = score
-                best_vlm_idx = vi
-        
-        if best_iou >= iou_threshold and best_vlm_idx >= 0:
-            vlm_used.add(best_vlm_idx)
-            vd = vlm_dets[best_vlm_idx]
+    for vd in vlm_dets:
+        if not isinstance(vd, dict):
+            continue
+            
+        if "id" in vd and vd["id"] in yolo_by_id:
+            yd = yolo_by_id[vd["id"]]
             merged.append({
                 "bbox": yd["bbox"],  # keep YOLO's precise bbox
                 "type": vd.get("type", yd.get("label", "div")),  # use VLM's semantic type
@@ -439,19 +463,10 @@ def _merge_detections(yolo_dets, vlm_dets, iou_threshold=0.5):
                 "confidence": max(yd.get("confidence", 0.5), vd.get("confidence", 0.5)),
                 "source": "yolo+vlm",
             })
-        else:
-            merged.append({
-                "bbox": yd["bbox"],
-                "type": yd.get("label", "div"),
-                "text": None,
-                "confidence": yd.get("confidence", 0.5),
-                "source": "yolo",
-            })
-    
-    # Add VLM-only detections (elements YOLO missed)
-    for vi, vd in enumerate(vlm_dets):
-        if vi not in vlm_used:
-            bbox = vd.get("bbox", [0, 0, 0, 0])
+            del yolo_by_id[vd["id"]]
+        elif "bbox" in vd:
+            # Missed element found by VLM
+            bbox = vd["bbox"]
             if isinstance(bbox, list) and len(bbox) == 4:
                 merged.append({
                     "bbox": tuple(float(v) for v in bbox),
@@ -461,6 +476,16 @@ def _merge_detections(yolo_dets, vlm_dets, iou_threshold=0.5):
                     "source": "vlm",
                 })
     
+    # Any YOLO detections not labeled by VLM are kept with default types
+    for yd in yolo_by_id.values():
+        merged.append({
+            "bbox": yd["bbox"],
+            "type": yd.get("label", "div"),
+            "text": None,
+            "confidence": yd.get("confidence", 0.5),
+            "source": "yolo",
+        })
+        
     return merged
 
 
