@@ -34,8 +34,8 @@ if exist "%PROJECT_ROOT%models_cache" (
     echo Deleting models_cache...
     rmdir /s /q "%PROJECT_ROOT%models_cache" 2>nul
 )
-if exist "%PROJECT_ROOT%yolov10n.pt" (
-    del /f /q "%PROJECT_ROOT%yolov10n.pt" 2>nul
+if exist "%PROJECT_ROOT%yolov*.pt" (
+    del /f /q "%PROJECT_ROOT%yolov*.pt" 2>nul
 )
 
 echo.
