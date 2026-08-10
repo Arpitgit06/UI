@@ -103,7 +103,7 @@ async def health() -> dict:
 @app.post("/jobs", response_model=Job)
 async def create_job(
     video: UploadFile = File(...),
-    enable_3d: bool = Form(False),
+    enable_3d: bool = Form(True),
     fast_mode: bool = Form(False)
 ) -> Job:
     if video.content_type not in ACCEPTED_VIDEO_TYPES:
