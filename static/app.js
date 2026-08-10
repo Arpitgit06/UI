@@ -18,7 +18,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const previewFileMeta = document.getElementById("previewFileMeta");
   const clearFileBtn = document.getElementById("clearFileBtn");
   const startPipelineBtn = document.getElementById("startPipelineBtn");
-  const enable3dToggle = document.getElementById("enable3dToggle");
 
   const pipelineSection = document.getElementById("pipelineSection");
   const jobIdBadge = document.getElementById("jobIdBadge");
@@ -162,11 +161,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const formData = new FormData();
     formData.append("video", selectedFile);
-    if (enable3dToggle && enable3dToggle.checked) {
-      formData.append("enable_3d", "true");
-    } else {
-      formData.append("enable_3d", "false");
-    }
+    formData.append("enable_3d", "true");
     
     const fastModeToggle = document.getElementById("fastModeToggle");
     if (fastModeToggle && fastModeToggle.checked) {
