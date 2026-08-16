@@ -84,6 +84,13 @@ if %errorlevel% neq 0 (
 )
 echo.
 
+echo Installing development dependencies (for testing)...
+"%VENV_PYTHON%" -m pip install -r "%PROJECT_ROOT%requirements-dev.txt"
+if %errorlevel% neq 0 (
+    echo WARNING: Failed to install development dependencies.
+)
+echo.
+
 :: 5. Create directories & configuration
 echo [5/6] Initializing storage directories and .env configuration...
 if not exist "%PROJECT_ROOT%storage\uploads" mkdir "%PROJECT_ROOT%storage\uploads"
