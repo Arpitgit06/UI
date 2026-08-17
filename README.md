@@ -171,12 +171,25 @@ curl -OJ http://localhost:8000/jobs/<job_id>/download
 
 ---
 
-<h2 style="color: #D0021B;">🧪 Testing</h2>
+<h2 style="color: #D0021B;">🧪 Testing & Load Testing</h2>
 
+**Run All Tests (Unit, Integration, and System Stress):**
 ```bash
-pytest
+python run_all_tests.py
 ```
-56 unit/integration tests run without any GPU or external service. They use hand-built stand-ins for the pieces that genuinely need a GPU. A full pipeline integration pass wires the **real, unmodified** Module A and C together with Module B/D (faked only at the GPU points) and runs an actual synthetic video through `run_pipeline()` end to end.
+This script acts as a central test runner. It executes over 50 unit/integration tests that run without any GPU or external service (using hand-built stubs), plus our newly added **System Stress Tests**. The system tests evaluate concurrent job queueing stability and verify that the orchestration layer safely handles heavy VRAM load sequentially without deadlocks.
+
+**Interactive Load & Stress Tester:**
+If you want to manually hammer the API to test its absolute limits, we include a gorgeous interactive CLI tester powered by `rich` and `httpx`.
+```bash
+# First, ensure the OmniUI server is running:
+./run.sh  # (or start.bat)
+
+# Then, in a separate terminal:
+python -m tests.run_load_test --jobs 10 --complexity high
+```
+- `--jobs`: The number of concurrent video uploads to fire at the server simultaneously.
+- `--complexity`: `low` sends simple videos; `high` generates and sends dense, rapidly changing synthetic UI videos specifically designed to push YOLO, Depth-Anything, OCR, and the local LLM pipeline to their maximum limits.
 
 ---
 
