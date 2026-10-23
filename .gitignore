@@ -1,33 +1,74 @@
-# Python
+# Python environments and caches
+.venv/
+venv/
+env/
+omniui_env/
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
-omniui_env/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
-# Env
+# Local configuration and credentials
 .env
+.env.*
+!.env.example
 
-# Runtime data (don't ship user uploads/outputs in version control)
-storage/uploads/*
-storage/jobs/*
-storage/outputs/*
-!storage/uploads/.gitkeep
-!storage/jobs/.gitkeep
-!storage/outputs/.gitkeep
-omniui_*
-*.zip
-
-models_cache/*
-!models_cache/.gitkeep
-
-# Editors
-.vscode/
-.idea/
-
-# Model Weights
+# Downloaded models, OCR data and browser binaries
+/models_cache/*
+!/models_cache/.gitkeep
 *.pt
 *.pth
 *.safetensors
+*.gguf
 *.onnx
+*.onnx.data
+*.ckpt
+
+# Private recordings, generated jobs, exports and runtime reports
+/storage/*
+!/storage/uploads/
+!/storage/jobs/
+!/storage/outputs/
+/storage/uploads/*
+/storage/jobs/*
+/storage/outputs/*
+!/storage/uploads/.gitkeep
+!/storage/jobs/.gitkeep
+!/storage/outputs/.gitkeep
+*.zip
+*.log
+*.mp4
+*.webm
+*.mkv
+
+# Frontend dependencies and generated builds
+node_modules/
+dist/
+build/
+.vite/
+coverage/
+playwright-report/
+test-results/
+
+# Internal audit and development notes
+/*_AUDIT*.md
+/*_STATUS.md
+/GENERALIZATION_REVIEW.md
+/LOCAL_GPU_PIPELINE.md
+
+# Local editor and agent settings
+.vscode/
+.idea/
+/.agents/
+/.codex/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
