@@ -15,7 +15,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class JobStatus(str, Enum):
@@ -30,6 +30,7 @@ class JobStatus(str, Enum):
 
 
 class BoundingBox(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     x: float
     y: float
     width: float = Field(ge=0)
@@ -44,8 +45,11 @@ class DetectedElement(BaseModel):
     text_content: Optional[str] = None
     hex_colors: list[str] = Field(default_factory=list)
     confidence: float = 0.0
-    detection_source: Literal["yolo", "vision_llm", "ocr", "verifier"] = "yolo"
+    detection_source: Literal["yolo", "vision_llm", "ocr", "verifier", "geometry"] = "yolo"
     raw_depth_range: Optional[float] = None  # pre-normalization depth range for 3D scene detection
+    styles: dict[str, str] = Field(default_factory=dict)
+    asset_path: Optional[str] = None
+    attributes: dict[str, str] = Field(default_factory=dict)
 
 
 class KeyStateFrame(BaseModel):
@@ -57,6 +61,8 @@ class KeyStateFrame(BaseModel):
     ssim_delta_from_previous: Optional[float] = None
     cursor_position: Optional[tuple[float, float]] = None
     inferred_action: Literal["hover", "click", "drag", "none"] = "none"
+    capture_reason: str = "stable"
+    action_confidence: float = 0.0
     ambient_motion_regions: list[tuple[float, float, float, float]] = Field(
         default_factory=list,
         description="Bounding boxes (x, y, w, h) of regions with continuous ambient motion (never-settling animation)",
@@ -73,6 +79,9 @@ class DOMNode(BaseModel):
     text_content: Optional[str] = None
     hex_colors: list[str] = Field(default_factory=list)
     confidence: float = 0.0
+    styles: dict[str, str] = Field(default_factory=dict)
+    asset_path: Optional[str] = None
+    attributes: dict[str, str] = Field(default_factory=dict)
     children: list["DOMNode"] = Field(default_factory=list)
 
 
@@ -88,6 +97,7 @@ class LayoutState(BaseModel):
     is_3d_scene: bool = False
     vision_verifier_approved: bool = False
     raw_depth_variance: Optional[float] = None  # pre-normalization depth variance for 3D scene detection
+    warnings: list[str] = Field(default_factory=list)
 
 
 class Job(BaseModel):
@@ -97,10 +107,14 @@ class Job(BaseModel):
     updated_at: datetime
     source_video_path: str
     output_zip_path: Optional[str] = None
+    reconstruction_status: Literal['not_assessed','preview_only','needs_review','accepted'] = 'not_assessed'
+    generated_artwork_available: bool = False
     error_message: Optional[str] = None
     current_stage_detail: Optional[str] = None
     key_states_detected: int = 0
     progress_percent: float = 0.0
-    enable_3d: bool = True
+    enable_3d: bool = False
     fast_mode: bool = False
+    render_mode: Literal["hybrid", "asset-backed", "editable"] = "hybrid"
+    warnings: list[str] = Field(default_factory=list)
 

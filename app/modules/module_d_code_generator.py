@@ -1,48 +1,4 @@
-"""
-Module D: Local Code Generation Engine
-
-Loads Module C's LayoutState tree(s) and emits React components, CSS,
-and (for states flagged as 3D) a React Three Fiber scene, using a local
-LLM (Qwen2.5-Coder-7B-Instruct) strictly as a syntax compiler.
-
-Why "syntax compiler" is taken literally here, not just as prompt
-flavor text: the architecture doc's own Stage 3 already separates
-"convert absolute coordinates into layout logic" (a Python step) from
-"generate the component" (the LLM step) -- and structured-output
-research is explicit that grammar-constrained JSON decoding guarantees
-syntactic validity, NOT value accuracy (a schema-constrained model can
-still emit a syntactically perfect but numerically wrong percentage or
-color). So every number and color the model would otherwise have to
-"convert" or "guess" is computed in Python BEFORE the prompt is built:
-
-  - Position/size: each node's bbox is expressed as a percentage of its
-    DIRECT PARENT's box (not the root), so `position: absolute` +
-    percentage left/top/width/height reproduces the captured layout
-    exactly and scales proportionally if the root container resizes.
-    This deliberately does not attempt Flexbox/Grid inference -- guessing
-    which elements "belong" in a flex row is exactly the kind of
-    interpretation this project's CV-first philosophy exists to avoid.
-  - 3D projection: each node's 2D bbox + z_index is projected into R3F
-    scene units (see _project_to_3d) once, in Python.
-  - Color: the node's own hex_colors (from Module B's Colorgram pass).
-
-The LLM's job is to transcribe this already-resolved tree into
-syntactically correct JSX/CSS/R3F -- matching the doc's framing that the
-LLM should "format the extracted logic," not invent it. Because
-grammar-constrained decoding doesn't guarantee value fidelity, every
-generation is mechanically re-checked afterward (_validate_component /
-_validate_scene3d): does every node's class name appear in both outputs,
-does its CSS block contain every property value exactly as computed,
-does its text content appear verbatim? A failed check retries (in case
-of a one-off slip) and ultimately raises a clear, itemized error rather
-than silently shipping code that doesn't match the input.
-
-Verification status: every deterministic function (percentage/3D-
-coordinate math, class name sanitization, the CSS-block extractor, and
-the validator itself against both a "faithful" and a deliberately
-corrupted fake response) plus the full retry/validation orchestration
-were verified -- see tests/test_module_d.py.
-"""
+"""Measured React compilation with coder-generated primitives and preserved artwork."""
 import asyncio
 import json
 import re
@@ -239,8 +195,12 @@ def _node_css(node: DOMNode, parent_bbox: Optional[BoundingBox]) -> dict[str, st
 
     if node.bbox.z_index is not None:
         css["z-index"] = str(int(round(node.bbox.z_index)))
-    if node.hex_colors:
+    if node.hex_colors and not node.styles:
         css["color" if node.text_content else "background-color"] = node.hex_colors[0]
+    # Only measured presentation properties; geometry stays compiler-owned.
+    allowed = {"color","background-color","font-family","font-size","font-weight","letter-spacing","line-height",
+               "text-align","border","border-radius","box-shadow","opacity","background-image","padding-left"}
+    css.update({k:v for k,v in node.styles.items() if k in allowed and not(parent_bbox is None and k=='border') and ";" not in v and "{" not in v and "}" not in v})
 
     return css
 
@@ -262,12 +222,24 @@ def _build_code_ready_tree(root: DOMNode, state_prefix: str) -> dict:
             "class_name": class_name,
             "tag": node.tag_hint,
             "text": node.text_content,
+            "element_type": node.element_type,
+            "attributes": node.attributes,
+            "asset_path": node.asset_path,
+            "bbox": node.bbox.model_dump(),
             "css": _node_css(node, parent_bbox),
             "position_3d": _project_to_3d(node.bbox, root.bbox),
             "children": [_walk(child, node.bbox) for child in node.children],
         }
 
-    return _walk(root, None)
+    tree=_walk(root,None)
+    def normalize_fonts(node):
+        font=node['css'].get('font-size','')
+        if font.endswith('px'):
+            try:node['css']['font-size']=f"{float(font[:-2])/max(root.bbox.width,1)*100:.5f}cqw"
+            except ValueError:pass
+        for child in node['children']:normalize_fonts(child)
+    normalize_fonts(tree)
+    return tree
 
 
 def _collect_class_names(code_tree: dict) -> set[str]:
@@ -302,25 +274,8 @@ def _build_package_json(needs_r3f: bool) -> str:
 
 
 def _build_index_scaffold(layouts: list[LayoutState]) -> str:
-    component_names = [_pascal_case(layout.state_name) for layout in layouts]
-    imports = "\n".join(f"import {name} from './{name}';" for name in component_names)
-    renders = "\n".join(f"      <{name} />" for name in component_names)
-    return (
-        f"{imports}\n"
-        f"import './styles.css';\n\n"
-        f"// Auto-generated gallery of every captured UI state. This does NOT attempt\n"
-        f"// to reconstruct the interactions between states (e.g. which state is a\n"
-        f"// hover/click result of which) -- that would require inferring transition\n"
-        f"// logic this pipeline doesn't attempt. Each state renders as its own\n"
-        f"// independent, pixel-accurate snapshot; wire up real navigation yourself.\n"
-        f"export default function App() {{\n"
-        f"  return (\n"
-        f"    <div className=\"omniui-state-gallery\">\n"
-        f"{renders}\n"
-        f"    </div>\n"
-        f"  );\n"
-        f"}}\n"
-    )
+    from app.modules.react_renderer import render_app
+    return render_app(layouts)
 
 
 def _build_index_html() -> str:
@@ -358,38 +313,28 @@ def _build_vite_config() -> str:
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
+  base: './',
   plugins: [react()],
 });
 """
 
 
 def _build_readme() -> str:
-    return """# OmniUI Generated UI
+    return """# OmniUI Generated Reconstruction
 
-This project was auto-generated by the OmniUI video-to-UI pipeline.
+Run `npm install`, then `npm run dev`. Run `npm run build` for production output.
 
-## Getting Started
+- App.jsx: state selection and timestamped playback
+- State*.jsx: compiled controls and measured editable view
+- public/assets: preserved reference artwork and extracted image/icon assets
+- design/*.json: semantic nodes and measured geometry/style attributes
+- transitions.json: uncertain action metadata requiring review
+- interaction_map.json: confirmed control-to-state mappings
+- verification_report.json: actual build, browser and screenshot results
+- verification/: captured output screenshots and difference heatmaps
 
-```bash
-npm install
-npm run dev
-```
-
-Open the URL shown in the terminal (usually http://localhost:5173).
-
-## Project Structure
-
-- `App.jsx` — Gallery of all captured UI states
-- `State*.jsx` — Individual state components (pixel-accurate layout)
-- `styles.css` — All CSS rules (using CSS custom properties for shared palette)
-- `transitions.json` — Cursor/action metadata per state transition
-- `verification_report.json` — Detection quality report
-
-## Notes
-
-- Each state renders independently — no transition logic is inferred
-- Layout uses `position: absolute` with percentage values for proportional scaling
-- Colors are extracted from the original video frames via Colorgram
+The artwork view preserves source pixels. The editable view is an approximation.
+Neither a tree-retention ratio nor a reference-image match proves application logic.
 """
 
 
@@ -401,6 +346,8 @@ def _build_transitions_json(layouts: list[LayoutState]) -> str:
             "timestamp_sec": frame.timestamp_sec,
             "frame_index": frame.frame_index,
             "inferred_action": frame.inferred_action,
+            "action_confidence": frame.action_confidence,
+            "requires_review": True,
             "cursor_position": list(frame.cursor_position) if frame.cursor_position else None,
             "ssim_delta": frame.ssim_delta_from_previous,
             "ambient_motion_regions": [
@@ -508,7 +455,7 @@ def _validate_component(code_tree: dict, component_jsx: str, styles_css: str) ->
                 # coincidentally both being "10.00%") -- pairing them closes that gap.
                 if not re.search(re.escape(prop) + r"\s*:\s*" + re.escape(value), block):
                     problems.append(f"'.{cls}' CSS block missing expected {prop}: {value}")
-        if node["text"] and node["text"] not in component_jsx:
+        if node["text"] and node["text"] not in component_jsx and json.dumps(node["text"], ensure_ascii=True) not in component_jsx:
             problems.append(f"expected text {node['text']!r} not found in component_jsx")
         for child in node["children"]:
             _walk(child)
@@ -540,54 +487,9 @@ def _validate_scene3d(code_tree: dict, scene3d_jsx: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _render_tree_to_jsx_and_css(code_tree: dict, component_name: str) -> tuple[str, str]:
-    css_rules = []
-
-    def _render_node(node: dict, indent: int = 4) -> str:
-        cls = node["class_name"]
-        tag = node["tag"] or "div"
-        text = node["text"] or ""
-
-        rule_lines = [f".{cls} {{"]
-        for k, v in node["css"].items():
-            rule_lines.append(f"  {k}: {v};")
-        rule_lines.append("}")
-        css_rules.append("\n".join(rule_lines))
-
-        ind = " " * indent
-        children_jsx = []
-        for child in node["children"]:
-            children_jsx.append(_render_node(child, indent + 2))
-
-        if text and children_jsx:
-            content = f"\n{ind}  {text}" + "".join(children_jsx) + f"\n{ind}"
-        elif text:
-            content = text
-        elif children_jsx:
-            content = "".join(children_jsx) + f"\n{ind}"
-        else:
-            content = ""
-
-        if content:
-            return f"\n{ind}<{tag} className=\"{cls}\">{content}</{tag}>"
-        else:
-            return f"\n{ind}<{tag} className=\"{cls}\" />"
-
-    root_jsx = _render_node(code_tree, indent=6)
-
-    # Add transition comment if cursor/action data available
-    transition_comment = ""
-    
-    component_jsx = (
-        f"import React from 'react';\n\n"
-        f"{transition_comment}"
-        f"export default function {component_name}() {{\n"
-        f"  return ({root_jsx}\n"
-        f"  );\n"
-        f"}}\n"
-    )
-    styles_css = "\n\n".join(css_rules)
-    return component_jsx, styles_css
+def _render_tree_to_jsx_and_css(code_tree: dict, component_name: str) -> tuple[str,str]:
+    from app.modules.react_renderer import render_component
+    return render_component(code_tree, component_name)
 
 
 def _render_tree_to_scene3d_jsx(code_tree: dict, component_name: str) -> str:
@@ -635,141 +537,8 @@ def _render_tree_to_scene3d_jsx(code_tree: dict, component_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-import subprocess
-import threading
-import sys
-
-class PersistentLLMWorker:
-    def __init__(self, max_jobs=4):
-        self.process = None
-        self.lock = threading.Lock()
-        self.jobs_processed = 0
-        self.max_jobs = max_jobs
-        self.current_model = None
-        
-    def start(self, model: str, load_in_4bit: bool):
-        if self.process is None or self.process.poll() is not None or self.current_model != model:
-            if self.process:
-                self.shutdown()
-                
-            self.process = subprocess.Popen(
-                [sys.executable, "-m", "app.modules.llm_subprocess_worker"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=None,
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="replace"
-            )
-            self.jobs_processed = 0
-            self.current_model = model
-            
-            init_payload = {
-                "model_name": model,
-                "load_in_4bit": load_in_4bit
-            }
-            self.process.stdin.write(json.dumps(init_payload) + "\n")
-            self.process.stdin.flush()
-            
-    def analyze(self, model: str, system_prompt: str, user_content: str, temperature: float, load_in_4bit: bool) -> dict:
-        with self.lock:
-            self.start(model, load_in_4bit)
-            
-            payload = {
-                "system_prompt": system_prompt,
-                "user_content": user_content,
-                "temperature": temperature,
-                "max_new_tokens": settings.local_llm_max_new_tokens
-            }
-            self.process.stdin.write(json.dumps(payload) + "\n")
-            self.process.stdin.flush()
-            
-            output = ""
-            while True:
-                line = self.process.stdout.readline()
-                if not line:
-                    self.process = None
-                    raise LocalLLMConnectionError("Local LLM worker subprocess died unexpectedly.")
-                
-                if "__LLM_JSON_START__" not in line and "__LLM_JSON_END__" not in line and line.strip():
-                    logger.info(f"[LLM Worker STDOUT] {line.strip()}")
-                    
-                output += line
-                if "__LLM_JSON_END__" in output:
-                    break
-                    
-            if "__LLM_JSON_START__" not in output or "__LLM_JSON_END__" not in output:
-                raise LocalLLMGenerationError("Local LLM response did not contain expected JSON markers.")
-                
-            json_str = output.split("__LLM_JSON_START__")[1].split("__LLM_JSON_END__")[0].strip()
-            
-            try:
-                return json.loads(json_str)
-            except (json.JSONDecodeError, AttributeError):
-                pass
-
-            fixed = _fix_json_string_escaping(json_str)
-            try:
-                return json.loads(fixed)
-            except (json.JSONDecodeError, AttributeError):
-                pass
-                
-            first_brace = fixed.find('{')
-            if first_brace != -1:
-                depth = 0
-                in_string = False
-                escape_next = False
-                for i in range(first_brace, len(fixed)):
-                    c = fixed[i]
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if c == '\\':
-                        escape_next = True
-                        continue
-                    if c == '"':
-                        in_string = not in_string
-                        continue
-                    if in_string:
-                        continue
-                    if c == '{':
-                        depth += 1
-                    elif c == '}':
-                        depth -= 1
-                        if depth == 0:
-                            candidate = fixed[first_brace:i + 1]
-                            try:
-                                return json.loads(candidate)
-                            except (json.JSONDecodeError, ValueError):
-                                break
-
-            raise LocalLLMGenerationError("Local LLM response wasn't valid JSON.")
-
-    def shutdown_if_needed(self):
-        with self.lock:
-            self.jobs_processed += 1
-            if self.jobs_processed >= self.max_jobs:
-                self.shutdown()
-                
-    def shutdown(self):
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
-                self.process.stdin.flush()
-                self.process.wait(timeout=10)
-            except Exception:
-                self.process.kill()
-            self.process = None
-
-_global_llm_worker = PersistentLLMWorker()
-
-async def _call_local_llm_structured(
-    model: str, system_prompt: str, user_content: str, schema: dict, temperature: float, load_in_4bit: bool
-) -> dict:
-    def _run():
-        return _global_llm_worker.analyze(model, system_prompt, user_content, temperature, load_in_4bit)
-    return await asyncio.to_thread(_run)
+async def _call_local_llm_structured(*args,**kwargs):
+    raise LocalLLMConnectionError('Legacy whole-scene generation is unavailable; the active coder writes native primitives via coder_runtime')
 
 
 async def _generate_component_and_styles(
@@ -854,109 +623,93 @@ async def _generate_scene3d(
 
 
 
-async def generate_code(
-    layouts: list[LayoutState],
-    fast_mode: bool = False,
-    code_model: Optional[str] = None,
-    temperature: Optional[float] = None,
-    max_retries: Optional[int] = None,
-    strict_validation: Optional[bool] = None,
-) -> dict[str, str]:
-    code_model = code_model or settings.local_llm_model_name
-    temperature = settings.local_llm_temperature if temperature is None else temperature
-    max_retries = max_retries or settings.local_llm_max_retries
-    strict_validation = settings.local_llm_strict_validation if strict_validation is None else strict_validation
-    load_in_4bit = settings.local_llm_load_in_4bit
-
-    if fast_mode:
-        logger.info("Module D executing in Fast Mode (Skipping LLM)")
+def _generate_code_sync(
+    layouts: list[LayoutState], fast_mode: bool = False, code_model=None,
+    temperature=None, max_retries=None, strict_validation=None,
+    render_mode: str = "hybrid",
+) -> dict[str, str | bytes]:
+    """Compile measured geometry; generate shared native JSX in a separate coder process."""
+    from app.modules.react_renderer import collect_assets, render_component, render_app, BASE_CSS
+    if not layouts:
+        raise ValueError("Cannot generate an empty project")
+    if render_mode not in {"hybrid","asset-backed","editable"}:
+        raise ValueError("Unknown render mode")
+    from app.modules.artwork_runtime import ARTWORK_COMPONENT
+    from app.modules.typography_runtime import TYPOGRAPHY_HOOK
+    from app.modules.component_runtime import MEASURED_COMPONENTS
+    if settings.code_generator == 'qwen':
+        from app.modules.coder_runtime import generate_primitives
+        primitives,coder_report = generate_primitives(layouts)
+    elif settings.code_generator == 'deterministic':
+        primitives,coder_report = MEASURED_COMPONENTS,{'status':'disabled','scope':'Deterministic compilation explicitly selected'}
     else:
-        logger.info(f"Module D executing local code generation with model: {code_model} (4-bit={load_in_4bit})")
-
-    files: dict[str, str] = {}
-    css_blocks: list[str] = []
-    any_3d = False
-
+        raise ValueError('Unsupported code generator')
+    files = {"MeasuredComponents.jsx":MEASURED_COMPONENTS,"scene_manifest.json":'{"entry_state":null,"intro":null}',"ArtworkMotion.jsx": ARTWORK_COMPONENT,"useMeasuredTypography.js":TYPOGRAPHY_HOOK, "motion_manifest.json": '{"regions":[],"sample_times":[],"source_size":[1,1]}'}
+    css = [BASE_CSS]
+    files['MeasuredComponents.jsx'] = primitives
+    files['code_generation.json'] = json.dumps(coder_report,indent=2)
+    files['generated_artwork.json']='{"status":"disabled"}'
     for layout in layouts:
-        code_tree = _build_code_ready_tree(layout.root, layout.state_name)
-        component_name = _pascal_case(layout.state_name)
+        tree = _build_code_ready_tree(layout.root, layout.state_name)
+        assets, reference = collect_assets(layout, tree)
+        # Vite copies public assets into dist without relying on runtime strings
+        # being detected as build-time import expressions.
+        files.update({f"public/{name}":content for name,content in assets.items()})
+        component = _pascal_case(layout.state_name)
+        jsx, styles = render_component(tree,component,reference,f"assets/{layout.state_name}-artwork.png" if f"assets/{layout.state_name}-artwork.png" in assets else None)
+        # Deterministic output is checked too; no unchecked fallback path.
+        problems = _validate_component(tree,jsx,styles)
+        if problems:
+            raise LocalLLMValidationError(f"Compiler output failed validation: {problems}")
+        files[f"{component}.jsx"] = jsx
+        css.append(styles)
+        files[f"design/{layout.state_name}.json"] = layout.model_dump_json(indent=2)
+    files.update({"styles.css":"\n\n".join(css),"App.jsx":render_app(layouts,render_mode),
+        "package.json":_build_package_json(False),"index.html":_build_index_html(),
+        "main.jsx":_build_main_jsx(),"vite.config.js":_build_vite_config(),
+        "transitions.json":_build_transitions_json(layouts),"interaction_map.json":"{}\n",
+        "README.md": _build_readme() + """
 
-        # Build transition comment for this state
-        frame = layout.source_frame
-        transition_comment = ""
-        if frame.cursor_position:
-            cx, cy = frame.cursor_position
-            transition_comment = (
-                f"{{/* Transition: {frame.inferred_action} near ({cx:.0f}, {cy:.0f}) "
-                f"at t={frame.timestamp_sec:.1f}s"
-            )
-            if frame.ssim_delta_from_previous is not None:
-                transition_comment += f", SSIM delta={frame.ssim_delta_from_previous:.4f}"
-            transition_comment += " */}\n"
+## Reconstruction modes
 
-        if fast_mode:
-            component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
-        else:
-            try:
-                component_jsx, styles_css = await _generate_component_and_styles(
-                    code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
-                )
-                if component_jsx.lstrip().startswith('{') or "import React" not in component_jsx:
-                    logger.warning(f"{component_name}: LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
-                    component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
-            except Exception as e:
-                logger.warning(f"{component_name}: LLM generation failed ({e}); falling back to deterministic Python renderer.")
-                component_jsx, styles_css = _render_tree_to_jsx_and_css(code_tree, component_name)
+Hybrid mode independently renders semantic text and native controls above preserved
+artwork whose semantic regions have been inpainted. Unparsed graphics remain raster
+assets. Automatic isolated-motion regions are in motion_manifest.json; scene/camera
+changes and undersampling are reported. These are preservation techniques, not
+recovered 3D meshes or verified application behavior. Compare hybrid fidelity with
+reference and editable scores separately in verification_report.json.
 
-        # Inject transition comment into component
-        if transition_comment and "export default function" in component_jsx:
-            component_jsx = component_jsx.replace(
-                "export default function",
-                f"{transition_comment}export default function",
-            )
+The default artwork view uses packaged source-frame PNGs with transparent native
+control overlays. It preserves complex artwork rather than pretending to recover
+editable geometry. Switch to Editable approximation to inspect measured HTML/CSS.
+Images and icons have extracted asset crops. These modes have separate fidelity
+and editability properties; a high screenshot score in artwork mode does not
+establish successful semantic reconstruction.
 
-        files[f"{component_name}.jsx"] = component_jsx
-        css_blocks.append(styles_css)
+The player selects one state at a time and replays captured timestamps. Guessed
+pointer actions in transitions.json are unconfirmed and are not automatically
+wired. Add confirmed mappings to interaction_map.json, for example:
 
-        if layout.is_3d_scene:
-            any_3d = True
-            if fast_mode:
-                scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
-            else:
-                try:
-                    scene3d_jsx = await _generate_scene3d(
-                        code_model, component_name, code_tree, temperature, max_retries, strict_validation, load_in_4bit
-                    )
-                    if scene3d_jsx.lstrip().startswith('{') or "import React" not in scene3d_jsx:
-                        logger.warning(f"{component_name}: 3D LLM output was raw JSON string or invalid; falling back to deterministic Python renderer.")
-                        scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
-                except Exception as e:
-                    logger.warning(f"{component_name}: 3D LLM generation failed ({e}); falling back to deterministic Python renderer.")
-                    scene3d_jsx = _render_tree_to_scene3d_jsx(code_tree, component_name)
-            files[f"Scene3D_{component_name}.jsx"] = scene3d_jsx
+    {"state_0": {"vision_llm-0001": "state_120"}}
 
-        logger.info(f"Module D: generated {component_name} ({len(code_tree['children'])} top-level child node(s))")
+Node IDs and measurements are in design/*.json and JSX data-node-id attributes.
+Inputs retain local native editing. Hidden backend behavior, authentication and
+native OS APIs cannot be recovered from video and must be implemented separately.
 
-    _global_llm_worker.shutdown_if_needed()
-
-    # Build shared color palette from all CSS blocks
-    color_to_var, updated_css_blocks = _extract_color_palette(css_blocks)
-    if color_to_var:
-        logger.info(f"Module D: extracted shared palette with {len(set(color_to_var.values()))} color variables")
-
-    files["styles.css"] = "\n\n".join(updated_css_blocks)
-    files["App.jsx"] = _build_index_scaffold(layouts)
-    files["package.json"] = _build_package_json(any_3d)
-    files["index.html"] = _build_index_html()
-    files["main.jsx"] = _build_main_jsx()
-    files["vite.config.js"] = _build_vite_config()
-    files["README.md"] = _build_readme()
-    files["transitions.json"] = _build_transitions_json(layouts)
-
+verification_report.json distinguishes semantic extraction, structural retention,
+build/runtime checks, and screenshot comparison. Unverified is not a visual pass.
+"""})
+    lockfile = settings.project_root / "tools" / "frontend" / "generated-package-lock.json"
+    if lockfile.exists():
+        files["package-lock.json"] = lockfile.read_text(encoding="utf-8")
     return files
 
 
-def _package_output_sync(job_id: str, files: dict[str, str]) -> Path:
+async def generate_code(layouts, fast_mode=False, render_mode="hybrid"):
+    return await asyncio.to_thread(_generate_code_sync,layouts,fast_mode,render_mode=render_mode)
+
+
+def _package_output_sync(job_id: str, files: dict[str, str | bytes]) -> Path:
     zip_path = settings.outputs_dir / f"{job_id}.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -965,6 +718,6 @@ def _package_output_sync(job_id: str, files: dict[str, str]) -> Path:
     return zip_path
 
 
-async def package_output(job_id: str, files: dict[str, str]) -> Path:
+async def package_output(job_id: str, files: dict[str, str | bytes]) -> Path:
     return await asyncio.to_thread(_package_output_sync, job_id, files)
 

@@ -225,7 +225,8 @@ def test_happy_path_produces_expected_files(monkeypatch):
 
     assert "State0.jsx" in files
     assert "styles.css" in files
-    assert "index.jsx" in files
+    assert "main.jsx" in files
+    assert "App.jsx" in files
     assert "package.json" in files
 
 
@@ -238,7 +239,9 @@ def test_retries_once_then_succeeds(monkeypatch):
     fake_llm = _FakeLLM(responses=[bad_response, good_response])
     monkeypatch.setattr(module_d, "_call_local_llm_structured", fake_llm.call)
 
-    files = asyncio.run(generate_code([layout], max_retries=2))
+    component, styles = asyncio.run(module_d._generate_component_and_styles(
+        "fake","State1",tree,0,2,True,False))
+    files = {"State1.jsx":component}
 
     assert "State1.jsx" in files
     assert len(fake_llm.calls) == 2
@@ -251,7 +254,7 @@ def test_raises_validation_error_after_exhausting_retries(monkeypatch):
     monkeypatch.setattr(module_d, "_call_local_llm_structured", fake_llm.call)
 
     with pytest.raises(LocalLLMValidationError, match="failed validation"):
-        asyncio.run(generate_code([layout], max_retries=2))
+        asyncio.run(module_d._generate_component_and_styles("fake","State2",_build_code_ready_tree(layout.root,layout.state_name),0,2,True,False))
 
 
 def test_connection_error_is_not_retried(monkeypatch):
@@ -260,12 +263,12 @@ def test_connection_error_is_not_retried(monkeypatch):
     monkeypatch.setattr(module_d, "_call_local_llm_structured", fake_llm.call)
 
     with pytest.raises(LocalLLMConnectionError, match="no subprocess"):
-        asyncio.run(generate_code([layout], max_retries=3))
+        asyncio.run(module_d._generate_component_and_styles("fake","State3",_build_code_ready_tree(layout.root,layout.state_name),0,3,True,False))
 
     assert len(fake_llm.calls) == 1, "a broken worker won't come up between retries, so this shouldn't retry"
 
 
-def test_3d_scene_generates_extra_file_and_r3f_dependency(monkeypatch):
+def test_3d_hint_does_not_fabricate_planes(monkeypatch):
     layout = _make_layout("state_4", is_3d=True)
     tree = _build_code_ready_tree(layout.root, layout.state_name)
     jsx, css = _build_faithful_response(tree)
@@ -279,8 +282,8 @@ def test_3d_scene_generates_extra_file_and_r3f_dependency(monkeypatch):
 
     files = asyncio.run(generate_code([layout]))
 
-    assert "Scene3D_State4.jsx" in files
-    assert "@react-three/fiber" in json.loads(files["package.json"])["dependencies"]
+    assert "Scene3D_State4.jsx" not in files
+    assert "@react-three/fiber" not in json.loads(files["package.json"])["dependencies"]
 
 
 

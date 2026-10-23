@@ -1,0 +1,5 @@
+# Optional generation stage. Recognition and normal UI compilation do not require these.
+diffusers==0.36.0
+gguf>=0.10,<1
+imageio-ffmpeg>=0.5,<1
+sentencepiece>=0.2,<1

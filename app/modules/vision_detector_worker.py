@@ -1,246 +1,90 @@
-"""
-Vision Detector Worker: Qwen2.5-VL-3B-Instruct subprocess for UI element detection.
-
-This is the Stage 1 detector in the hybrid parallel pipeline. It receives:
-  - An image path (key-state screenshot)
-  - Optional YOLO pre-detections (bounding boxes found by YOLO on CPU)
-
-It returns a structured JSON array of detected UI elements with type, bbox,
-text content, and confidence. When YOLO pre-detections are provided, the
-prompt instructs the model to:
-  1. Assign semantic labels to YOLO's existing boxes
-  2. Detect any additional UI elements YOLO missed
-This reduces output tokens and processing time vs. full-frame detection.
-
-Runs in an isolated subprocess for 100% VRAM cleanup on exit.
-"""
+"""Bounded per-region semantic classification; text/geometry are never generated."""
 import json
 import os
 import sys
 from pathlib import Path
 
-# Better CUDA memory allocation for GPUs with limited VRAM (e.g. 8GB)
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-# Setup strict local cache paths before importing torch/transformers
-project_root = Path(__file__).resolve().parent.parent.parent
-models_cache_dir = project_root / "models_cache"
-models_cache_dir.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("HF_HOME", str(models_cache_dir))
-os.environ.setdefault("TRANSFORMERS_CACHE", str(models_cache_dir))
-os.environ.setdefault("TORCH_HOME", str(models_cache_dir))
+from app.config import settings
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF","garbage_collection_threshold:0.6")
 
 
-_DETECTOR_PROMPT_WITH_YOLO = """\
-You are a precise UI element detector. A fast pre-detector found these bounding boxes:
-{yolo_detections}
-
-Your task:
-1. Assign a UI element type (and text) to each pre-detected box by referencing its "id". Do NOT output the bbox again.
-2. Find any missed UI elements and report them with their "bbox" [x, y, w, h].
-
-UI element types: button, text, input, checkbox, radio, switch, slider, icon, image, navbar, toolbar, card, modal, drawer, list, list_item, video, canvas, container, header, footer, sidebar, tab, dropdown, tooltip, badge, avatar, progress_bar, divider, link
-
-Return ONLY a JSON array. Example:
-[
-  {{"id": 0, "type": "button", "text": "Submit", "confidence": 0.95}},
-  {{"id": 1, "type": "image", "text": null, "confidence": 0.90}},
-  {{"type": "icon", "bbox": [5, 5, 20, 20], "text": null, "confidence": 0.85}}
-]
-"""
-
-_DETECTOR_PROMPT_NO_YOLO = """\
-You are a precise UI element detector analyzing a screenshot of a user interface.
-
-Carefully scan the entire screenshot and detect every distinct UI element. Element types to look for:
-button, text, input, checkbox, radio, switch, slider, icon, image, navbar, toolbar, card, modal, drawer, list, list_item, video, canvas, container, header, footer, sidebar, tab, dropdown, tooltip, badge, avatar, progress_bar, divider, link
-
-For EVERY element found, provide:
-- "type": the UI element type from the list above
-- "bbox": bounding box as [x, y, width, height] in pixels
-- "text": any visible text content (null if none)
-- "confidence": your confidence from 0.0 to 1.0
-
-Return ONLY a JSON array. Example:
-[
-  {{"type": "button", "bbox": [10, 20, 100, 40], "text": "Submit", "confidence": 0.95}},
-  {{"type": "text", "bbox": [120, 20, 200, 20], "text": "Hello World", "confidence": 0.99}}
-]
-"""
-
-
-def _resolve_model_path(model_name: str) -> str:
-    """Resolve HuggingFace model name to local snapshot path if available."""
-    hub_dir = models_cache_dir / "hub" / f"models--{model_name.replace('/', '--')}" / "snapshots"
-    if hub_dir.exists():
-        snapshots = list(hub_dir.iterdir())
-        if snapshots:
-            resolved = str(snapshots[0])
-            print(f"[Vision Detector] Found local snapshot: {resolved}", file=sys.stderr, flush=True)
-            return resolved
-    return model_name
-
-
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("[Vision Detector] Error: payload file path required as argument", file=sys.stderr, flush=True)
-        sys.exit(1)
-
-    payload_file = sys.argv[1]
-    with open(payload_file, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    model_name = payload["model_name"]
-    image_paths = payload.get("image_paths", [])
-    if "image_path" in payload and not image_paths:
-        image_paths = [payload["image_path"]]
-    yolo_detections_per_image = payload.get("yolo_detections", [])  # list of lists
-    temperature = float(payload.get("temperature", 0.1))
-    max_new_tokens = int(payload.get("max_new_tokens", 2048))
-    load_in_4bit = bool(payload.get("load_in_4bit", True))
-
-    try:
-        import torch
-        from transformers import AutoProcessor
-
-        # Try Qwen2.5-VL first (newer), fall back to Qwen2-VL
-        try:
-            from transformers import Qwen2_5_VLForConditionalGeneration as VLModel
-            print("[Vision Detector] Using Qwen2.5-VL model class", file=sys.stderr, flush=True)
-        except ImportError:
-            from transformers import Qwen2VLForConditionalGeneration as VLModel
-            print("[Vision Detector] Falling back to Qwen2-VL model class", file=sys.stderr, flush=True)
-
-        from qwen_vl_utils import process_vision_info
-
-        resolved_name = _resolve_model_path(model_name)
-
-        print(f"[Vision Detector] Loading processor for {model_name}...", file=sys.stderr, flush=True)
-        processor = AutoProcessor.from_pretrained(
-            resolved_name,
-            cache_dir=str(models_cache_dir),
-            local_files_only=False,
-            min_pixels=256 * 28 * 28,
-            max_pixels=384 * 28 * 28,
-        )
-
-        model_kwargs = {
-            "cache_dir": str(models_cache_dir),
-            "local_files_only": False,
-        }
-        if load_in_4bit and torch.cuda.is_available():
-            try:
-                from transformers import BitsAndBytesConfig
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                )
-                model_kwargs["device_map"] = {"": "cuda:0"}
-            except Exception as exc:
-                print(f"[Vision Detector] 4-bit unavailable ({exc}), using fp16", file=sys.stderr, flush=True)
-                model_kwargs["torch_dtype"] = torch.float16
-                model_kwargs["device_map"] = "auto"
+def main(payload_override=None):
+    if payload_override is None:
+        with open(sys.argv[1],encoding="utf-8") as source:
+            payload=json.load(source)
+    else:
+        payload=payload_override
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
+    from huggingface_hub import snapshot_download
+    from qwen_vl_utils import process_vision_info
+    model_name=payload["model_name"]
+    from app.core.model_budget import configure_recognition
+    profile=configure_recognition(torch,model_name,settings.cuda_device_index)
+    profile['worker_pid']=os.getpid()
+    resolved=snapshot_download(repo_id=model_name,cache_dir=str(settings.models_cache_dir/"hub"),local_files_only=settings.offline)
+    processor=AutoProcessor.from_pretrained(resolved,local_files_only=True,min_pixels=56*56,max_pixels=448*448)
+    kwargs={"local_files_only":True,"device_map":"auto"}
+    if torch.cuda.is_available():
+        kwargs.update({"device_map":{"":f"cuda:{settings.cuda_device_index}"},"quantization_config":BitsAndBytesConfig(
+            load_in_4bit=True,bnb_4bit_quant_type="nf4",bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)})
+    else:
+        kwargs["torch_dtype"]=torch.float16 if torch.cuda.is_available() else torch.float32
+    print(f"Loading grounded semantic classifier {model_name}",file=sys.stderr,flush=True)
+    model=AutoModelForImageTextToText.from_pretrained(resolved,**kwargs)
+    codes={"A":"text","B":"button","C":"input","D":"checkbox","E":"slider","F":"dropdown"}
+    allowed={}
+    for code,kind in codes.items():
+        encoded=processor.tokenizer.encode(" "+code,add_special_tokens=False)
+        if len(encoded)!=1:
+            encoded=processor.tokenizer.encode(code,add_special_tokens=False)
+        if len(encoded)!=1:
+            raise RuntimeError("Semantic label cannot be represented by one token")
+        allowed[encoded[0]]=kind
+    results=[]
+    for image_index,(path,anchors) in enumerate(zip(payload["image_paths"],payload["anchors"])):
+        with Image.open(path) as original:
+            image=original.convert("RGB")
+        labels={}
+        for index,anchor in enumerate(anchors):
+            x,y,w,h=map(float,anchor["bbox"])
+            # A local context query avoids parroting an example sequence across
+            # dozens of regions. Each classification starts a fresh conversation.
+            crop=image.crop((max(0,int(x-max(12,w*.3))),max(0,int(y-max(12,h*1.5))),
+                             min(image.width,int(x+w+max(12,w*.3))),min(image.height,int(y+h+max(12,h*1.5)))))
+            prompt=("Classify the region labeled "+json.dumps(str(anchor.get("text") or "")[:160])+". "
+                    "Choose ONE letter: A=static text/heading/artwork, B=clickable button/link, "
+                    "C=editable text input, D=checkbox/radio/switch, E=slider, F=dropdown. "
+                    "Use the cropped screenshot as context. Reply with one letter only.")
+            messages=[{"role":"user","content":[{"type":"image","image":crop},{"type":"text","text":prompt}]}]
+            text=processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
+            info=process_vision_info(messages)
+            inputs=processor(text=[text],images=info[0],padding=True,return_tensors="pt").to(model.device)
+            with torch.inference_mode():
+                output=model.generate(**inputs,max_new_tokens=1,min_new_tokens=1,do_sample=False,
+                    prefix_allowed_tokens_fn=lambda batch,input_ids:list(allowed))
+            token=int(output[0,-1])
+            labels[str(index)]=allowed[token]
+            del inputs,output
+            if (index+1)%10==0:
+                print(f"Image {image_index+1}: classified {index+1}/{len(anchors)} anchors",file=sys.stderr,flush=True)
+        if payload.get("mode")=="verify":
+            corrections=[{"id":i,"type":labels[str(i)]} for i,a in enumerate(anchors) if a.get("type","text")!=labels[str(i)]]
+            result={"approved":not corrections,"corrections":corrections,"missed_elements":[],"deleted_ids":[]}
         else:
-            model_kwargs["torch_dtype"] = torch.float16 if torch.cuda.is_available() else torch.float32
-            model_kwargs["device_map"] = "auto"
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        print(f"[Vision Detector] Loading 3B model weights...", file=sys.stderr, flush=True)
-        model = VLModel.from_pretrained(resolved_name, **model_kwargs)
-        print("[Vision Detector] Model loaded into VRAM.", file=sys.stderr, flush=True)
-
-        results = []
-        for img_idx, img_path in enumerate(image_paths):
-            # Build prompt based on whether YOLO pre-detections are available
-            yolo_dets = yolo_detections_per_image[img_idx] if img_idx < len(yolo_detections_per_image) else []
-            
-            if yolo_dets:
-                yolo_summary = json.dumps([{"id": i, "bbox": d["bbox"], "confidence": d.get("confidence", 0.5)} for i, d in enumerate(yolo_dets)], indent=2)
-                prompt_text = _DETECTOR_PROMPT_WITH_YOLO.format(yolo_detections=yolo_summary)
-            else:
-                prompt_text = _DETECTOR_PROMPT_NO_YOLO
-
-            prompt_text += "\nIMPORTANT: Output ONLY valid JSON array, no markdown fences or extra text."
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": f"file://{img_path}"},
-                        {"type": "text", "text": prompt_text},
-                    ],
-                }
-            ]
-
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            vision_info = process_vision_info(messages)
-            if len(vision_info) == 3:
-                image_inputs, video_inputs, video_kwargs = vision_info
-            else:
-                image_inputs, video_inputs = vision_info
-                video_kwargs = {}
-
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-                **(video_kwargs or {}),
-            )
-            inputs = inputs.to(model.device)
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            vram_alloc = torch.cuda.memory_allocated(0) / (1024**3) if torch.cuda.is_available() else 0
-            print(f"[Vision Detector] Image {img_idx+1}/{len(image_paths)}: generating ({vram_alloc:.1f}GB VRAM)...", file=sys.stderr, flush=True)
-
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    temperature=max(temperature, 0.01),
-                    do_sample=temperature > 0.0,
-                )
-
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            response_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0].strip()
-
-            print(f"[Vision Detector] Done image {img_idx+1}.", file=sys.stderr, flush=True)
-
-            # Clean markdown fences
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-
-            results.append(response_text)
-
-            # Cleanup tensors
-            del inputs, generated_ids, generated_ids_trimmed
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        print("__VISION_JSON_START__")
-        print(json.dumps(results))
-        print("__VISION_JSON_END__")
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+            result=labels
+        results.append(json.dumps(result))
+        print(f"Image {image_index+1}: complete",file=sys.stderr,flush=True)
+    print("__VISION_JSON_START__")
+    profile.update({'peak_allocated_bytes':torch.cuda.max_memory_allocated(settings.cuda_device_index),
+                    'peak_reserved_bytes':torch.cuda.max_memory_reserved(settings.cuda_device_index)})
+    if payload.get('metrics_path'):
+        Path(payload['metrics_path']).write_text(json.dumps(profile,indent=2),encoding='utf-8')
+    print(json.dumps(results))
+    print("__VISION_JSON_END__")
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

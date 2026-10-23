@@ -23,32 +23,10 @@ class Settings:
         os.environ.setdefault("HF_HOME", str(self.models_cache_dir))
         os.environ.setdefault("TRANSFORMERS_CACHE", str(self.models_cache_dir))
         os.environ.setdefault("TORCH_HOME", str(self.models_cache_dir))
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(self.models_cache_dir / "browsers"))
         os.environ.setdefault("PADDLEX_HOME", str(self.models_cache_dir / "paddlex"))
         os.environ.setdefault("PADDLE_HOME", str(self.models_cache_dir / "paddle"))
         os.environ.setdefault("ULTRALYTICS_CONFIG_DIR", str(self.models_cache_dir / "ultralytics"))
-
-        # Auto-migrate yolov10n.pt from root directory into models_cache, or remove duplicate from root
-        root_yolo = self.project_root / "yolov10n.pt"
-        cache_yolo = self.models_cache_dir / "yolov10n.pt"
-        if root_yolo.exists():
-            try:
-                if not cache_yolo.exists():
-                    import shutil
-                    shutil.move(str(root_yolo), str(cache_yolo))
-                else:
-                    root_yolo.unlink()
-            except Exception:
-                pass
-
-        # Auto-migrate ~/.paddlex official models into project models_cache/paddlex if present outside
-        user_paddlex = Path.home() / ".paddlex"
-        cache_paddlex = self.models_cache_dir / "paddlex"
-        if user_paddlex.exists() and not cache_paddlex.exists():
-            try:
-                import shutil
-                shutil.copytree(str(user_paddlex), str(cache_paddlex), dirs_exist_ok=True)
-            except Exception:
-                pass
 
         # VRAM safety
         self.min_free_vram_mb = float(os.environ.get("OMNIUI_MIN_FREE_VRAM_MB", 512.0))
@@ -82,15 +60,29 @@ class Settings:
         # for why this is a ratio rather than strict corner-containment.
         self.dom_containment_threshold = float(os.environ.get("OMNIUI_DOM_CONTAINMENT_THRESHOLD", 0.8))
 
-        # Local LLM (Module D) — loaded directly via Hugging Face / transformers
-        self.local_llm_model_name = os.environ.get("OMNIUI_LLM_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
-        self.vision_llm_model_name = os.environ.get("OMNIUI_VISION_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
-        self.vision_detector_model_name = os.environ.get("OMNIUI_VISION_DETECTOR_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
+        # Models execute in separate, sequential processes. Only the Qwen stages use NF4.
+        self.vision_detector_model_name = os.environ.get("OMNIUI_VISION_DETECTOR_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
+        self.local_llm_model_name = os.environ.get("OMNIUI_CODE_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
+        self.code_generator = os.environ.get("OMNIUI_CODE_GENERATOR", "qwen")
         self.local_llm_load_in_4bit = os.environ.get("OMNIUI_LLM_4BIT", "true").lower() == "true"
         self.local_llm_temperature = float(os.environ.get("OMNIUI_LLM_TEMPERATURE", 0.1))
         self.local_llm_max_new_tokens = int(os.environ.get("OMNIUI_LLM_MAX_TOKENS", 4096))
-        self.local_llm_max_retries = int(os.environ.get("OMNIUI_LLM_MAX_RETRIES", 1))
-        self.local_llm_strict_validation = os.environ.get("OMNIUI_LLM_STRICT_VALIDATION", "false").lower() == "true"
+        self.local_llm_max_retries = int(os.environ.get("OMNIUI_LLM_MAX_RETRIES", 2))
+        self.local_llm_strict_validation = os.environ.get("OMNIUI_LLM_STRICT_VALIDATION", "true").lower() == "true"
+        self.offline = os.environ.get("OMNIUI_OFFLINE", "true").lower() == "true"
+        self.worker_timeout_sec = int(os.environ.get("OMNIUI_WORKER_TIMEOUT_SEC", 600))
+        self.vision_max_new_tokens = int(os.environ.get("OMNIUI_VISION_MAX_TOKENS", 4096))
+        self.vision_max_pixels = int(os.environ.get("OMNIUI_VISION_MAX_PIXELS", 1280 * 720))
+        self.max_upload_bytes = int(os.environ.get("OMNIUI_MAX_UPLOAD_MB", 512)) * 1024**2
+        self.max_video_seconds = int(os.environ.get("OMNIUI_MAX_VIDEO_SECONDS", 600))
+        self.max_video_pixels = int(os.environ.get("OMNIUI_MAX_VIDEO_PIXELS", 3840 * 2160))
+        self.max_pending_jobs = int(os.environ.get("OMNIUI_MAX_PENDING_JOBS", 8))
+        self.max_key_states = int(os.environ.get("OMNIUI_MAX_KEY_STATES", 12))
+        self.motion_max_samples = int(os.environ.get('OMNIUI_MOTION_MAX_SAMPLES',80))
+        self.motion_max_regions = int(os.environ.get('OMNIUI_MOTION_MAX_REGIONS',4))
+        self.artwork_generator=os.environ.get('OMNIUI_ARTWORK_GENERATOR','ltx-2b-fp16')
+        self.visual_verification = os.environ.get("OMNIUI_VISUAL_VERIFICATION", "true").lower() == "true"
+        self.require_visual_verification = os.environ.get("OMNIUI_REQUIRE_VISUAL_VERIFICATION", "true").lower() == "true"
 
     def ensure_directories(self) -> None:
         for d in (self.uploads_dir, self.jobs_dir, self.outputs_dir, self.models_cache_dir):

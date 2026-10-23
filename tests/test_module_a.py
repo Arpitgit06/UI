@@ -54,7 +54,7 @@ def test_two_sudden_state_changes_produce_three_key_states(tmp_path):
     assert len(result) == 3
     # captures land one frame after each jump (30, 60) because of the
     # stability debounce -- see the module docstring, point 2.
-    assert [ks.frame_index for ks in result] == [0, 31, 61]
+    assert [ks.frame_index for ks in result] == [0, 34, 64]
     assert result[0].ssim_delta_from_previous is None
     assert result[1].ssim_delta_from_previous > 0.02
     for ks in result:

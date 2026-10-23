@@ -1,67 +1,4 @@
-"""
-Module A: Temporal Video Parser (CPU / light GPU)
-
-Reads an MP4/WebM recording and reduces it to a handful of "key state"
-images -- the frames where the UI actually settled into a genuinely new
-state -- using SSIM-based frame diffing, plus a lightweight
-motion-centroid heuristic to guess where the change originated
-(cursor/touch position) and whether it looks like a hover, click, or
-drag.
-
-Design notes (read before tuning thresholds -- each of these was found
-by testing against synthetic frames/videos, not assumed):
-
-  1. Keyframe decisions compare each incoming frame against the LAST
-     CAPTURED key state, not the literally-previous raw frame (frame
-     N-1). Diffing only against N-1 misses slow, gradual transitions
-     (a fading modal, a slow drag): no single step ever crosses the
-     threshold even though the cumulative change is large. Comparing
-     against a persistent reference correctly accumulates that drift.
-
-  2. Reference-diffing alone isn't enough, though: during a
-     *continuous* motion (e.g. a slow drag), every incremental frame
-     already differs enough from the reference, so a naive
-     "capture whenever changed_enough" rule fires on almost every frame
-     of the drag and resets the reference each time -- instead of one
-     "before" and one "after" state, you get dozens of near-duplicate
-     captures, one per few pixels of motion. The fix is a second,
-     independent check: only capture once the video has gone STABLE
-     frame-to-frame again (i.e. motion has stopped), then test that
-     settled frame against the reference. This applies uniformly to
-     both sudden jumps (a modal appearing in one frame) and gradual
-     ones (a drag) -- sudden jumps just settle one frame later, which
-     is a negligible, deliberate trade-off.
-
-  3. The SSIM comparisons run on a downscaled COLOR proxy, not
-     grayscale. Grayscale SSIM is faster but risks under-weighting
-     color-only UI changes (a hover/error state that shifts hue at
-     similar luminance) -- and exact colors are the whole point of this
-     project, so channel information is kept in both comparisons.
-
-  4. Motion/cursor tracking runs on full-resolution GRAYSCALE frames
-     (color doesn't matter for localizing "where did something change",
-     and skipping color keeps this cheap enough to run on every raw
-     frame). It's classical frame-differencing + centroid-of-the-diff,
-     not a learned cursor detector -- there's no guarantee a real OS
-     cursor sprite is even visible in the recording. Treat
-     inferred_action and cursor_position as a best-effort heuristic to
-     be retuned against real recordings, not ground truth.
-
-  5. Ambient motion detection (v2): regions of the frame that keep
-     changing for a large fraction of the clip duration (e.g. rotating
-     rings, pulsing animations, floating particles) are detected by
-     tracking per-grid-cell instability over time. If a cell fails the
-     stability check for >60% of the clip, it's flagged as "ambient
-     motion" and changes in that region are ignored for key-state
-     decisions. These regions are reported so Module D can express them
-     as CSS @keyframes or R3F animations rather than emitting one
-     StateN.jsx per frame of the loop.
-
-  6. Post-capture deduplication: after all key states are extracted,
-     a final pass merges states whose SSIM > 0.97 (near-identical
-     frames that slipped through, typically from small sub-threshold
-     ambient drift). This is a safety net, not the primary filter.
-"""
+"""Scan complete recordings, select stable states and bounded motion samples, and persist an explicit full-duration timeline."""
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
@@ -301,168 +238,154 @@ def _deduplicate_states(
 
 
 def _extract_key_states_sync(
-    video_path: str,
-    output_dir: Path,
-    ssim_change_threshold: float = 0.01,
-    stability_ssim_threshold: float = 0.95,
-    ssim_proxy_width: int = 480,
-    frame_stride: int = 1,
-    motion_diff_threshold: int = 25,
-    motion_min_area: int = 50,
-    motion_max_area_fraction: float = 0.6,
-    drag_distance_px: float = 40.0,
-    click_max_duration_sec: float = 0.35,
-    max_key_states: int = 30,
-    ambient_grid_rows: int = 4,
-    ambient_grid_cols: int = 4,
-    ambient_threshold_fraction: float = 0.6,
-    dedup_ssim_threshold: float = 0.97,
+    video_path: str, output_dir: Path, ssim_change_threshold: float = 0.01,
+    stability_ssim_threshold: float = 0.95, ssim_proxy_width: int = 640,
+    frame_stride: int = 1, motion_diff_threshold: int = 25,
+    motion_min_area: int = 50, motion_max_area_fraction: float = 0.6,
+    drag_distance_px: float = 40.0, click_max_duration_sec: float = 0.35,
+    max_key_states: int = 30, ambient_grid_rows: int = 8,
+    ambient_grid_cols: int = 8, ambient_threshold_fraction: float = 0.6,
+    dedup_ssim_threshold: float = 0.995, stability_duration_sec: float = 0.12,
+    motion_sample_interval_sec: float = 1.5,
 ) -> list[KeyStateFrame]:
+    """Scan the entire clip, select bounded candidates, then decode selected frames.
+
+    Pixel-local motion plus a dwell window prevents a small moving control from
+    being mistaken for a stable screen. Continuous artwork still gets periodic
+    samples and an end frame. The capture budget never terminates decoding.
+    """
+    import json
+    import math
+    from app.config import settings
+
+    if frame_stride < 1 or max_key_states < 2:
+        raise ValueError("frame_stride must be >= 1 and max_key_states >= 2")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise VideoReadError(
-            f"Could not open video at {video_path}. Confirm the file exists and is a "
-            f"valid MP4/WebM (if WebM, your OpenCV build needs FFmpeg VP8/VP9 support)."
-        )
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    key_states: list[KeyStateFrame] = []
-    reference_proxy: Optional[np.ndarray] = None  # proxy of the last CAPTURED key state
-    prev_frame_proxy: Optional[np.ndarray] = None  # proxy of the immediately preceding raw frame
-    prev_gray: Optional[np.ndarray] = None
-    motion_since_last_capture: list[_MotionSample] = []
+        raise VideoReadError(f"Could not open video at {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0:
+        cap.release()
+        raise VideoReadError("Video has no valid frame rate")
+    candidates = []
+    previous = reference = None
+    samples = []
+    stable_count = 0
+    required_stable = max(1, int(np.ceil(stability_duration_sec * fps / frame_stride)))
     raw_index = -1
+    last_candidate_index = 0
+    frame_h = frame_w = 0
+    instability = np.zeros((ambient_grid_rows, ambient_grid_cols), dtype=np.int32)
+    comparisons = 0
+    last_proxy = None
 
-    # Ambient motion tracking: count how many frame-comparisons each grid cell was unstable
-    instability_counts = np.zeros((ambient_grid_rows, ambient_grid_cols), dtype=np.int32)
-    total_comparisons = 0
-    ambient_mask = np.zeros((ambient_grid_rows, ambient_grid_cols), dtype=bool)
-    frame_h, frame_w = 0, 0
+    def changed(a, b):
+        delta = np.max(cv2.absdiff(a, b), axis=2)
+        # Local changes survive even if global SSIM barely moves (tooltips/text).
+        local = np.count_nonzero(delta > motion_diff_threshold) / delta.size
+        score = float(ssim(a, b, channel_axis=-1, data_range=255))
+        return ((1.0 - score) > ssim_change_threshold or local > 0.001), score
+
+    def add(index, proxy, reason):
+        nonlocal reference, samples, last_candidate_index
+        different, score = (True, 1.0) if reference is None else changed(reference, proxy)
+        if not different:
+            return
+        cursor, action = _classify_action(samples, fps, drag_distance_px, click_max_duration_sec)
+        candidates.append({"frame_index": index, "timestamp_sec": index / fps,
+                           "cursor_position": cursor, "inferred_action": action,
+                           "action_confidence": 0.25 if cursor else 0.0,
+                           "ssim_delta_from_previous": None if reference is None else round(1-score, 5),
+                           "capture_reason": reason})
+        reference = proxy.copy()
+        last_candidate_index = index
+        samples = []
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            ok, frame = cap.read()
+            if not ok:
                 break
             raw_index += 1
-            if raw_index % frame_stride != 0:
+            if raw_index / fps > settings.max_video_seconds:
+                raise VideoReadError(f"Video exceeds {settings.max_video_seconds} second limit")
+            frame_h, frame_w = frame.shape[:2]
+            if frame_h * frame_w > settings.max_video_pixels:
+                raise VideoReadError("Video resolution exceeds configured pixel limit")
+            if raw_index % frame_stride:
                 continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             proxy = _downscale(frame, ssim_proxy_width)
-            
-            if frame_h == 0:
-                frame_h, frame_w = frame.shape[:2]
-
-            # Track regional instability for ambient motion detection
-            if prev_gray is not None:
-                grid_changed = _build_instability_grid(
-                    _downscale(prev_gray.reshape(prev_gray.shape[0], prev_gray.shape[1]), ssim_proxy_width // 2) 
-                    if len(prev_gray.shape) == 2 else prev_gray,
-                    _downscale(gray.reshape(gray.shape[0], gray.shape[1]), ssim_proxy_width // 2)
-                    if len(gray.shape) == 2 else gray,
-                    ambient_grid_rows,
-                    ambient_grid_cols,
-                )
-                instability_counts += grid_changed.astype(np.int32)
-                total_comparisons += 1
-                
-                # Update ambient mask periodically (every 30 comparisons or at 20% of clip)
-                if total_comparisons > 0 and total_comparisons % 30 == 0:
-                    ambient_mask = (instability_counts / total_comparisons) >= ambient_threshold_fraction
-
-            if prev_gray is not None:
-                sample = _motion_centroid(
-                    prev_gray, gray, motion_diff_threshold, motion_min_area, motion_max_area_fraction
-                )
-                if sample is not None:
-                    motion_since_last_capture.append(_MotionSample(raw_index, *sample))
-
-            is_first_frame = reference_proxy is None
-            should_capture = is_first_frame
-            change_score: Optional[float] = None
-            if not is_first_frame:
-                instant_score = ssim(prev_frame_proxy, proxy, channel_axis=-1, data_range=255)
-                is_stable_now = instant_score > stability_ssim_threshold
-                if is_stable_now:
-                    change_score = ssim(reference_proxy, proxy, channel_axis=-1, data_range=255)
-                    should_capture = (1.0 - change_score) > ssim_change_threshold
-                    
-                    # Check if the change is ONLY in ambient regions — if so, don't capture
-                    if should_capture and ambient_mask.any():
-                        is_ambient_only = _is_in_ambient_region(
-                            proxy, reference_proxy, ambient_mask,
-                            ambient_grid_rows, ambient_grid_cols, ssim_change_threshold,
-                        )
-                        if is_ambient_only:
-                            should_capture = False
-                            logger.debug(f"Frame {raw_index}: change is only in ambient regions, skipping capture")
-
-            if should_capture:
-                if len(key_states) >= max_key_states:
-                    logger.warning(
-                        f"Hit max_key_states={max_key_states}; stopping early. This usually "
-                        f"means the input is noisy/flickering rather than a clean UI recording -- "
-                        f"consider raising ssim_change_threshold."
-                    )
-                    break
-
-                if is_first_frame:
-                    cursor_position, inferred_action, ssim_delta = None, "none", None
-                else:
-                    cursor_position, inferred_action = _classify_action(
-                        motion_since_last_capture, fps, drag_distance_px, click_max_duration_sec
-                    )
-                    ssim_delta = round(1.0 - change_score, 4)
-
-                image_path = output_dir / f"state_{len(key_states):03d}.png"
-                cv2.imwrite(str(image_path), frame)
-
-                key_states.append(
-                    KeyStateFrame(
-                        frame_index=raw_index,
-                        timestamp_sec=(raw_index / fps) if fps > 0 else 0.0,
-                        image_path=str(image_path),
-                        ssim_delta_from_previous=ssim_delta,
-                        cursor_position=cursor_position,
-                        inferred_action=inferred_action,
-                    )
-                )
-                reference_proxy = proxy
-                motion_since_last_capture = []
-
-            prev_frame_proxy = proxy
-            prev_gray = gray
+            last_proxy = proxy
+            gray = cv2.cvtColor(proxy, cv2.COLOR_BGR2GRAY)
+            if previous is None:
+                add(raw_index, proxy, "initial")
+            else:
+                previous_gray = cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY)
+                instability += _build_instability_grid(previous_gray, gray, ambient_grid_rows, ambient_grid_cols)
+                comparisons += 1
+                delta = np.max(cv2.absdiff(previous, proxy), axis=2)
+                local_motion = np.count_nonzero(delta > motion_diff_threshold) / delta.size
+                instant = ssim(previous, proxy, channel_axis=-1, data_range=255)
+                stable = local_motion < 0.0003 and instant >= stability_ssim_threshold
+                stable_count = stable_count + 1 if stable else 0
+                sample = _motion_centroid(previous_gray, gray, motion_diff_threshold,
+                                          max(3, int(motion_min_area * (proxy.shape[1]/frame_w)**2)),
+                                          motion_max_area_fraction)
+                if sample:
+                    scale = frame_w / proxy.shape[1]
+                    samples.append(_MotionSample(raw_index, sample[0]*scale, sample[1]*scale, sample[2]))
+                    samples = samples[-int(fps * 10):]
+                if stable_count >= required_stable:
+                    add(raw_index, proxy, "stable")
+                elif (raw_index - last_candidate_index) / fps >= motion_sample_interval_sec:
+                    add(raw_index, proxy, "motion_sample")
+            previous = proxy
+        if raw_index < 0:
+            raise VideoReadError(f"No frames could be read from {video_path}")
+        if last_proxy is not None:
+            add(raw_index - raw_index % frame_stride, last_proxy, "final")
     finally:
         cap.release()
 
-    if not key_states:
-        raise VideoReadError(f"No frames could be read from {video_path}.")
-
-    # Detect final ambient motion regions and attach to all key states
-    ambient_regions = _detect_ambient_regions(
-        instability_counts, total_comparisons,
-        ambient_grid_rows, ambient_grid_cols,
-        frame_h, frame_w, ambient_threshold_fraction,
-    )
-    if ambient_regions:
-        logger.info(f"Module A: detected {len(ambient_regions)} ambient motion region(s)")
-        for state in key_states:
-            state.ambient_motion_regions = ambient_regions
-
-    # Post-capture deduplication: merge near-identical states
-    key_states = _deduplicate_states(key_states, dedup_ssim_threshold, ssim_proxy_width)
-
-    logger.info(
-        f"Module A: {video_path} -> {len(key_states)} key state(s) "
-        f"(fps={fps:.1f}, change_threshold={ssim_change_threshold}, "
-        f"stability_threshold={stability_ssim_threshold}, "
-        f"ambient_regions={len(ambient_regions)})"
-    )
+    candidate_count = len(candidates)
+    if candidate_count > max_key_states:
+        indices = np.linspace(0, candidate_count-1, max_key_states, dtype=int)
+        selected = [candidates[i] for i in indices]
+    else:
+        selected = candidates
+    ambient_regions = _detect_ambient_regions(instability, comparisons,
+        ambient_grid_rows, ambient_grid_cols, frame_h, frame_w, ambient_threshold_fraction)
+    # Sequential second decode avoids inaccurate seeking in inter-frame codecs.
+    wanted = {item["frame_index"]: item for item in selected}
+    key_states = []
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        index = -1
+        while wanted:
+            ok, frame = cap.read()
+            if not ok:
+                raise VideoReadError("Video could not be decoded consistently on second pass")
+            index += 1
+            if index not in wanted:
+                continue
+            item = wanted.pop(index)
+            image_path = output_dir / f"state_{index:06d}.png"
+            if not cv2.imwrite(str(image_path), frame):
+                raise VideoReadError(f"Unable to write {image_path}")
+            key_states.append(KeyStateFrame(**item, image_path=str(image_path),
+                                             ambient_motion_regions=ambient_regions))
+    finally:
+        cap.release()
+    manifest = {"fps": fps, "frames_scanned": raw_index+1, "duration_sec": (raw_index+1)/fps,
+                "analyzed_through_sec": raw_index/fps, "full_video_scanned": True,
+                "candidate_count": candidate_count, "selected_count": len(selected),
+                "omitted_candidates": candidate_count-len(selected),
+                "states": [state.model_dump() for state in key_states]}
+    (output_dir / "timeline.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    logger.info("Module A: scanned %s frames; selected %s/%s candidates across %.2fs",
+                raw_index+1, len(selected), candidate_count, (raw_index+1)/fps)
     return key_states
 
 

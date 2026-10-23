@@ -10,6 +10,7 @@ import warnings
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 # WINDOWS DLL CONFLICT FIX: PaddleOCR -> paddlex -> modelscope transitively
 # imports torch. If paddle's C++ runtime loads first, it blocks torch's shm.dll
@@ -21,7 +22,7 @@ os.environ["FLAGS_use_gpu"] = "0"
 os.environ["FLAGS_enable_pir_in_executor"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "1"
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "1"
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() or 4)
+os.environ["OMP_NUM_THREADS"] = "4"
 
 # WINDOWS DLL CONFLICT FIX: PaddleOCR -> paddlex -> modelscope transitively
 # imports torch. If paddle's C++ runtime loads first, it blocks torch's shm.dll
@@ -51,60 +52,7 @@ def _xyxy_to_bbox_tuple(x1: float, y1: float, x2: float, y2: float) -> tuple[flo
     return float(x1), float(y1), float(x2 - x1), float(y2 - y1)
 
 
-def _parse_paddleocr_result(res) -> list[dict]:
-    if res is None:
-        return []
-
-    # Case 1: Classic list-of-lines `[[box, [text, score]], ...]`
-    if isinstance(res, (list, tuple)):
-        parsed = []
-        for item in res:
-            if not isinstance(item, (list, tuple)) or len(item) != 2:
-                continue
-            box, (text, score) = item[0], item[1]
-            if isinstance(box, (list, tuple)) and len(box) == 4:
-                if all(isinstance(p, (list, tuple)) and len(p) == 2 for p in box):
-                    x1 = min(float(p[0]) for p in box)
-                    y1 = min(float(p[1]) for p in box)
-                    x2 = max(float(p[0]) for p in box)
-                    y2 = max(float(p[1]) for p in box)
-                elif all(isinstance(v, (int, float)) for v in box):
-                    x1, y1, x2, y2 = [float(v) for v in box]
-                else:
-                    continue
-                parsed.append(
-                    {
-                        "text": text,
-                        "confidence": float(score),
-                        "box": _xyxy_to_bbox_tuple(x1, y1, x2, y2),
-                    }
-                )
-        return parsed
-    
-    # Case 2: Dict format (paddlex v3 style)
-    parsed = []
-    if hasattr(res, "get"):
-        text_polys = res.get("text_polys", [])
-        rec_text = res.get("rec_text", [])
-        rec_score = res.get("rec_score", [])
-        
-        for i in range(min(len(text_polys), len(rec_text), len(rec_score))):
-            poly = text_polys[i]
-            if not isinstance(poly, (list, tuple)) or len(poly) != 4:
-                continue
-            x1 = min(float(p[0]) for p in poly)
-            y1 = min(float(p[1]) for p in poly)
-            x2 = max(float(p[0]) for p in poly)
-            y2 = max(float(p[1]) for p in poly)
-            
-            parsed.append(
-                {
-                    "text": rec_text[i],
-                    "confidence": float(rec_score[i]),
-                    "box": _xyxy_to_bbox_tuple(x1, y1, x2, y2),
-                }
-            )
-    return parsed
+from app.modules.ocr_adapter import _parse_paddleocr_result
 
 
 def main() -> None:
@@ -136,12 +84,26 @@ def main() -> None:
             confidence_threshold = float(payload.get("confidence_threshold", 0.5))
             
             if ocr is None:
+                from app.config import settings
+                model_options = {}
+                if settings.offline:
+                    base = models_cache_dir / "paddlex" / "official_models"
+                    detections = sorted(base.glob("*det"), reverse=True)
+                    recognitions = sorted(base.glob("*rec"), reverse=True)
+                    if not detections or not recognitions:
+                        raise RuntimeError("OCR models are not cached; run setup.bat online once")
+                    model_options = {"text_detection_model_dir":str(detections[0]),
+                                     "text_recognition_model_dir":str(recognitions[0]),
+                                     "text_detection_model_name":detections[0].name,
+                                     "text_recognition_model_name":recognitions[0].name}
                 ocr = PaddleOCR(
                     lang=lang,
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
-                    use_mkldnn=True,
+                    enable_mkldnn=False,
+                    cpu_threads=4,
+                    **model_options,
                     device="cpu",
                 )
             

@@ -161,14 +161,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const formData = new FormData();
     formData.append("video", selectedFile);
-    formData.append("enable_3d", "true");
+    formData.append("enable_3d", "false");
+    formData.append("render_mode", document.getElementById("renderModeSelect").value);
     
-    const fastModeToggle = document.getElementById("fastModeToggle");
-    if (fastModeToggle && fastModeToggle.checked) {
-      formData.append("fast_mode", "true");
-    } else {
-      formData.append("fast_mode", "false");
-    }
+    formData.append("fast_mode", "true");
 
     try {
       const res = await fetch("/jobs", {
@@ -225,7 +221,11 @@ document.addEventListener("DOMContentLoaded", () => {
   function updateUIForJob(job) {
     // Status badge
     jobStatusBadge.textContent = job.status.toUpperCase();
+    if(job.status === 'complete' && job.reconstruction_status !== 'accepted') {
+      jobStatusBadge.textContent = job.reconstruction_status === 'preview_only' ? 'PREVIEW ONLY' : 'RECONSTRUCTION NEEDS REVIEW';
+    }
     jobStatusBadge.className = `status-badge ${job.status === 'queued' ? 'queued' : (job.status === 'complete' ? 'complete' : (job.status === 'failed' ? 'failed' : 'running'))}`;
+    if(job.status === 'complete' && job.reconstruction_status !== 'accepted') jobStatusBadge.className='status-badge queued';
 
     // Progress Bar
     const progress = job.progress_percent || 0.0;
@@ -261,7 +261,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (job.status === "complete") {
       completionActions.classList.remove("hidden");
       downloadZipBtn.href = `/jobs/${job.job_id}/download`;
+      document.getElementById("previewResultBtn").href = `/jobs/${job.job_id}/preview/`;
+      document.getElementById("previewResultBtn").textContent = job.reconstruction_status === 'accepted' ? 'Open reconstructed UI' : 'Open draft preview';
+      document.getElementById("reviewResultBtn").href = `/jobs/${job.job_id}/review/ui`;
+      let artworkLink=document.getElementById('generatedArtworkBtn');
+      if(job.generated_artwork_available){
+        if(!artworkLink){artworkLink=document.createElement('a');artworkLink.id='generatedArtworkBtn';artworkLink.className=document.getElementById('previewResultBtn').className;artworkLink.target='_blank';artworkLink.rel='noopener';completionActions.appendChild(artworkLink);}
+        artworkLink.href=`/jobs/${job.job_id}/preview/?artwork=generated`;artworkLink.textContent='Review LTX artwork candidate';artworkLink.classList.remove('hidden');
+      }else if(artworkLink)artworkLink.classList.add('hidden');
       errorBox.classList.add("hidden");
+      if (job.warnings && job.warnings.length) {
+        stageDetailText.textContent = `Generated with review notes: ${job.warnings.join(" · ")}`;
+      }
     } else if (job.status === "failed") {
       completionActions.classList.add("hidden");
       errorBox.classList.remove("hidden");

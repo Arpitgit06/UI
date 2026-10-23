@@ -1,55 +1,4 @@
-"""
-Module C: The "DOM" Synthesizer (CPU-bound)
-
-Pure mathematical processing: takes Module B's FLAT list of
-DetectedElement (bounding boxes, text, colors, per-element depth) and
-reconstructs a parent-child DOMNode tree by spatial containment, then
-persists it as `{state_name}_layout.json` -- the exact contract Module D
-consumes.
-
-Containment algorithm:
-
-  - "A is contained in B" uses an overlap RATIO
-    (intersection_area(A, B) / area(A) >= dom_containment_threshold),
-    not strict corner containment. Real detections are noisy -- a
-    button's box and the text inside it rarely align to the pixel --
-    so requiring literal full containment would miss real parent-child
-    relationships over a few pixels of detector imprecision.
-
-  - Each element's PARENT is the smallest-area element that contains it
-    (the tightest enclosing box), not just any containing box. A text
-    label sitting inside a button which sits inside a card should
-    attach to the button directly, not skip straight to the card.
-
-  - A parent candidate must have STRICTLY greater area than the child.
-    This one rule also makes the algorithm cycle-proof by construction:
-    a cycle would require two elements each with area strictly greater
-    than the other, which is impossible for real numbers. Elements with
-    no valid containing element become direct children of a synthesized
-    root/page node sized to the actual source image dimensions.
-
-  - Near-duplicate boxes (similar element and near-identical size) are
-    NOT nested into each other under this rule -- they end up as
-    siblings. This is a deliberate simplicity choice: arbitrarily
-    picking one of two near-identical boxes as the "parent" would be a
-    coin flip, not a meaningful structural decision.
-
-  - Within a parent, children are sorted by z_index ascending (farthest
-    first, nearest last) to match typical HTML/CSS painting order,
-    where later-in-DOM elements render on top absent explicit
-    stacking rules.
-
-Deliberately NOT attempted here: distinguishing a genuine 3D scene from
-a flat 2D UI (LayoutState.is_3d_scene is left at its False default).
-Module B's z_index values are already min-max normalized to 0-100 per
-state, which stretches even a tiny real depth range to fill the full
-scale -- so the normalized values alone can't tell "meaningfully
-layered" apart from "flat, but normalization amplified noise." Making
-this determination reliably would need Module B to also pass through
-some pre-normalization statistic (e.g. the raw depth range or
-variance); that's a small, targeted addition to make later rather than
-a heuristic guess bolted on here.
-"""
+"""Build semantically valid containment trees with measured presentation attributes. Scene depth is not CSS stacking order."""
 import asyncio
 import json
 from pathlib import Path
@@ -69,6 +18,15 @@ logger = get_logger("omniui.module_c")
 # this runs against Module B's current stock (non-UI-trained) YOLO weights.
 _TAG_HINT_MAP = {
     "text": "span",
+    "link": "a",
+    "radio": "input",
+    "canvas": "div",
+    "header": "header",
+    "footer": "footer",
+    "sidebar": "aside",
+    "container": "div",
+    "dropdown": "select",
+    "tab": "button",
     "button": "button",
     "text_button": "button",
     "input": "input",
@@ -147,6 +105,10 @@ def _assign_parents(elements: list[DetectedElement], containment_threshold: floa
         best_parent_id: Optional[str] = None
         best_parent_area = float("inf")
         for other in elements:
+            if _tag_hint_for(other.element_type) not in {"div","nav","aside","header","footer","ul","li","button"}:
+                continue
+            if _tag_hint_for(other.element_type) == "button" and _tag_hint_for(el.element_type) in {"button","input","select","a"}:
+                continue
             if other.element_id == el.element_id:
                 continue
             if areas[other.element_id] <= areas[el.element_id]:
@@ -190,6 +152,12 @@ def _detected_element_to_dom_node(el: DetectedElement) -> DOMNode:
         text_content=el.text_content,
         hex_colors=el.hex_colors,
         confidence=el.confidence,
+        styles=el.styles,
+        asset_path=el.asset_path,
+        attributes={**({"type": {"checkbox":"checkbox", "radio":"radio", "radio_button":"radio",
+                    "slider":"range", "date_picker":"date", "switch":"checkbox",
+                    "on/off_switch":"checkbox", "number_stepper":"number"}.get(el.element_type,"text")}
+                    if _tag_hint_for(el.element_type) == "input" else {}), **el.attributes},
     )
 
 
@@ -227,8 +195,16 @@ def _deduplicate(elements: list[DetectedElement]) -> list[DetectedElement]:
         if el.element_id in seen:
             logger.warning(f"Duplicate element_id {el.element_id!r} in detections; keeping first occurrence.")
             continue
-        seen.add(el.element_id)
-        unique.append(el)
+        duplicate = False
+        for previous in unique:
+            intersection = _intersection_area(el.bbox, previous.bbox)
+            union = _area(el.bbox)+_area(previous.bbox)-intersection
+            if union and intersection/union > .85 and el.element_type == previous.element_type and el.text_content == previous.text_content:
+                duplicate = True
+                break
+        if not duplicate:
+            seen.add(el.element_id)
+            unique.append(el)
     return unique
 
 
@@ -247,26 +223,10 @@ def _detect_3d_scene(
     2. Significant z-index spread across detected elements (>= 65 on normalized 0-100 scale)
     3. Raw pre-normalization depth variance (if available from Module B)
     """
-    if not detections:
-        return False
-    
-    # Check Vision LLM-assigned element types for 3D indicators
-    for el in detections:
-        if el.element_type:
-            et = el.element_type.lower()
-            if any(k in et for k in ("3d", "canvas", "webgl", "mesh", "model", "scene", "viewport", "orbit")):
-                return True
-    
-    # Check raw depth range (pre-normalization) — most reliable signal
-    if raw_depth_variance is not None and raw_depth_variance > 50.0:
-        return True
-    
-    # Check normalized z-index spread (less reliable due to normalization stretching)
-    z_vals = [el.bbox.z_index for el in detections if el.bbox.z_index is not None]
-    if len(z_vals) >= 3 and (max(z_vals) - min(z_vals)) >= 65.0:
-        return True
-    
-    return False
+    # Depth range, normalized z-index and generic canvas labels are not evidence
+    # of editable geometry. Explicit semantics are an optional scene hint only.
+    return any(el.element_type.lower() in {"3d_view", "webgl", "mesh", "3d_scene"}
+               for el in detections)
 
 
 def _synthesize_dom_sync(
@@ -284,6 +244,35 @@ def _synthesize_dom_sync(
 
     root_bbox = _root_bbox_from_image(state.image_path) or _union_bbox(detections)
     root = DOMNode(node_id="root", tag_hint="div", element_type="page", bbox=root_bbox)
+    try:
+        from app.modules.visual_styles import measure_styles
+        with Image.open(state.image_path) as image:
+            root.styles = measure_styles(image, (0,0,image.width,image.height),None,"page")
+            from app.modules.visual_styles import control_rectangles
+            rectangles=control_rectangles(image)
+            refreshed=[]
+            for element in detections:
+                box=element.bbox
+                if element.element_type in {'button','input','dropdown','link','tab'}:
+                    choices=[]
+                    for x,y,w,h in rectangles:
+                        intersection=max(0,min(x+w,box.x+box.width)-max(x,box.x))*max(0,min(y+h,box.y+box.height)-max(y,box.y))
+                        if intersection/max(box.width*box.height,1)>.65 and w>=box.width*.9 and 15<h<180 and w*h<image.width*image.height*.15:
+                            choices.append((w*h,BoundingBox(x=x,y=y,width=w,height=h)))
+                    if choices:box=min(choices,key=lambda item:item[0])[1]
+                presentation=measure_styles(image,(box.x,box.y,box.width,box.height),element.text_content,element.element_type)
+                if element.text_content and element.attributes.get('data-text-bbox'):
+                    try:
+                        text_box=json.loads(element.attributes['data-text-bbox'])
+                        measured_text=measure_styles(image,text_box,element.text_content,'text')
+                        presentation.update({k:v for k,v in measured_text.items() if k in {'font-size','color','font-family'}})
+                    except (ValueError,TypeError):pass
+                refreshed.append(element.model_copy(update={'bbox':box,'styles':presentation}))
+            detections=refreshed
+            from app.modules.visual_groups import augment_visual_groups
+            detections=augment_visual_groups(image,detections)
+    except OSError:
+        pass
 
     if detections:
         parent_of = _assign_parents(detections, containment_threshold)
@@ -309,7 +298,7 @@ def write_layout_json(layout_state: LayoutState, output_dir: Path) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{layout_state.state_name}_layout.json"
-    json_path.write_text(layout_state.model_dump_json(indent=2))
+    json_path.write_text(layout_state.model_dump_json(indent=2), encoding="utf-8")
     return json_path
 
 

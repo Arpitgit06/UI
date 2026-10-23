@@ -1,0 +1,116 @@
+{
+  "title": "FORGE-HUB COCKPIT",
+  "provenance": "Reviewed reconstruction of the supplied recording. Layout and tool labels are authored from the reference; tool integrations are local demonstrations.",
+  "tools": [
+    {
+      "id": "moneyprinter",
+      "name": "MoneyPrinter",
+      "detail": "Video",
+      "icon": "video",
+      "x": 29.5,
+      "y": 12,
+      "color": "#62f7bf",
+      "width": 13.5
+    },
+    {
+      "id": "forge",
+      "name": "FORGE-HUB",
+      "detail": "Engine",
+      "icon": "hex",
+      "x": 48,
+      "y": 9.5,
+      "color": "#60caff",
+      "width": 13.3
+    },
+    {
+      "id": "focus",
+      "name": "Foocus",
+      "detail": "ImageGen",
+      "icon": "aperture",
+      "x": 65.5,
+      "y": 12.5,
+      "color": "#a6ddd8",
+      "width": 10.5
+    },
+    {
+      "id": "appflowy",
+      "name": "AppFlowy",
+      "detail": "Neural Audio",
+      "icon": "audio",
+      "x": 80.4,
+      "y": 14.5,
+      "color": "#9eeaff",
+      "width": 11.5
+    },
+    {
+      "id": "penpot",
+      "name": "Penpot",
+      "detail": "Prototyping",
+      "icon": "pen",
+      "x": 24.5,
+      "y": 27.5,
+      "color": "#a2f4f5",
+      "width": 11.3
+    },
+    {
+      "id": "headroom",
+      "name": "Headroom",
+      "detail": "Analyzer",
+      "icon": "wave",
+      "x": 84,
+      "y": 28.5,
+      "color": "#a2cfff",
+      "width": 12
+    },
+    {
+      "id": "localrecall",
+      "name": "LocalRecall",
+      "detail": "Memory",
+      "icon": "globe",
+      "x": 86,
+      "y": 42.3,
+      "color": "#bddfff",
+      "width": 12.5
+    },
+    {
+      "id": "markitdown",
+      "name": "MarkitDown",
+      "detail": "RAG Agent",
+      "icon": "file",
+      "x": 82.5,
+      "y": 55.5,
+      "color": "#ffdb9d",
+      "width": 12.5
+    },
+    {
+      "id": "vision",
+      "name": "Vision-VLM",
+      "detail": "Moondream",
+      "icon": "moon",
+      "x": 9.2,
+      "y": 56,
+      "color": "#c6b4ff",
+      "width": 13.4
+    },
+    {
+      "id": "guard",
+      "name": "Guard Agent",
+      "detail": "Security",
+      "icon": "shield",
+      "x": 18,
+      "y": 64.3,
+      "color": "#80f9e9",
+      "width": 13.6
+    },
+    {
+      "id": "reach",
+      "name": "Agent-Reach",
+      "detail": "Research",
+      "icon": "globe",
+      "x": 71.3,
+      "y": 67.5,
+      "color": "#93f4ff",
+      "width": 17
+    }
+  ]
+}

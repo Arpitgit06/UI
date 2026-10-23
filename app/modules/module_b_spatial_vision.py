@@ -1,25 +1,4 @@
-"""
-Module B: Hybrid Parallel Spatial Vision & Detection Engine
-
-Architecture (v2 — Hybrid Parallel):
-
-  YOLO runs on CPU (system RAM) in parallel with Vision LLM loading on GPU.
-  YOLO finishes in ~200ms during the ~5-10s the Vision LLM takes to load.
-  Then the 3B Vision LLM receives YOLO's boxes as context, reducing its
-  workload to: (1) label YOLO boxes semantically, (2) detect anything
-  YOLO missed. The 7B Vision LLM then verifies the merged result.
-
-  Pipeline stages:
-    1. YOLO macro + micro (CPU, ONNX) — fast bounding boxes     [~200ms]
-    2. Vision LLM 3B (GPU subprocess) — semantic labels + gaps   [~10-30s]
-    3. Vision LLM 7B (GPU subprocess) — verify + correct         [~10-30s]
-    4. PaddleOCR (CPU subprocess) — precise text bboxes           [~1-3s]
-    5. Colorgram.py (CPU) — dominant colors per crop              [~1s]
-    6. Depth-Anything-V2 (GPU) — per-pixel depth → z_index        [~3-5s]
-
-  YOLO (stage 1) and Vision LLM loading (stage 2 model load) overlap.
-  This is free parallelism — YOLO uses CPU/RAM, VLM uses GPU/VRAM.
-"""
+"""Sequential local UI detection, spatial OCR fusion, strict geometry validation, measured styles and explicit degradation diagnostics."""
 import json
 import os
 import sys
@@ -29,11 +8,13 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from app.config import settings
+from app.core.process_runner import run_worker
 from app.core.vram_manager import GPUPipelineGuard
 from app.models.schemas import BoundingBox, DetectedElement, KeyStateFrame
 from app.utils.logger import get_logger
@@ -143,149 +124,60 @@ def _iou(box_a, box_b):
 
 
 def _load_yolo_cpu(weights_path, export_onnx):
-    """Load YOLO model for CPU inference, preferring ONNX for speed."""
     from pathlib import Path
-    from ultralytics import YOLO, settings as ul_settings
+    from ultralytics import YOLO
+    target = Path(weights_path)
+    if not target.is_file():
+        raise FileNotFoundError(f"UI checkpoint not found: {target}")
+    model = YOLO(str(target),task="detect")
+    model.overrides["device"] = "cpu"
+    _require_ui_taxonomy(model)
+    if export_onnx and target.suffix == ".pt":
+        onnx = target.with_suffix(".onnx")
+        if not onnx.exists():
+            model.export(format="onnx",device="cpu")
+        model = YOLO(str(onnx),task="detect")
+        model.overrides["device"] = "cpu"
+    return model
 
-    models_cache_dir = Path(__file__).resolve().parent.parent.parent / "models_cache"
-    try:
-        ul_settings.update({"weights_dir": str(models_cache_dir)})
-    except Exception:
-        pass
 
-    target_path = Path(weights_path)
-    if not target_path.is_absolute() or not target_path.exists():
-        cached = models_cache_dir / target_path.name
-        if cached.exists():
-            weights_path = str(cached)
-
-    # Prefer ONNX for 3x-5x CPU speedup
-    if export_onnx:
-        onnx_path = Path(weights_path).with_suffix(".onnx")
-        if onnx_path.exists():
-            logger.info(f"Loading ONNX model: {onnx_path}")
-            return YOLO(str(onnx_path), task="detect")
-        elif Path(weights_path).exists():
-            logger.info(f"Exporting to ONNX: {weights_path}")
-            try:
-                model = YOLO(weights_path)
-                model.export(format="onnx")
-                if onnx_path.exists():
-                    return YOLO(str(onnx_path), task="detect")
-            except Exception as e:
-                logger.warning(f"ONNX export failed: {e}")
-
-    return YOLO(weights_path)
+def _require_ui_taxonomy(model):
+    names = getattr(model,"names",{})
+    labels = {str(v).lower().replace(" ","_") for v in (names.values() if isinstance(names,dict) else names)}
+    if not labels.intersection({"button","text","input","text_button","icon","container","card","image_view"}):
+        raise ValueError("YOLO checkpoint has no UI taxonomy; configure UI-trained weights (COCO weights are unsupported)")
 
 
 def _run_yolo_cpu(states, yolo_macro_path, yolo_micro_path, export_onnx, confidence_threshold):
-    """Run both YOLO models on CPU. Returns list of detection lists per state."""
-    logger.info(f"YOLO CPU: starting on {len(states)} images (macro={yolo_macro_path}, micro={yolo_micro_path})")
-    
-    image_paths = [state.image_path for state in states]
-    yolo_results = [[] for _ in states]
-    
-    try:
-        # Load macro detector
-        macro_model = _load_yolo_cpu(yolo_macro_path, export_onnx)
-        
-        for i, path in enumerate(image_paths):
-            macro_res = macro_model.predict(path, conf=confidence_threshold, verbose=False, device="cpu")[0]
-            boxes = _parse_yolo_boxes(macro_res.boxes, macro_res.names)
-            for box in boxes:
-                box["level"] = "macro"
-            yolo_results[i].extend(boxes)
-        
-        del macro_model
-        
-        # Load micro detector  
-        micro_model = _load_yolo_cpu(yolo_micro_path, export_onnx)
-        
-        for i, (state, image_path) in enumerate(zip(states, image_paths)):
-            macro_boxes = [d for d in yolo_results[i] if d["level"] == "macro"]
-            image = Image.open(image_path).convert("RGB")
-            
-            if not macro_boxes:
-                # No macro containers — run micro on full image
-                micro_res = micro_model.predict(image_path, conf=confidence_threshold, verbose=False, device="cpu")[0]
-                micro_boxes = _parse_yolo_boxes(micro_res.boxes, micro_res.names)
-                for mb in micro_boxes:
-                    mb["level"] = "micro"
-                yolo_results[i].extend(micro_boxes)
-            else:
-                # Run micro on each macro container crop
-                for m_box in macro_boxes:
-                    x, y, w, h = m_box["bbox"]
-                    crop = image.crop((int(x), int(y), int(x + w), int(y + h)))
-                    micro_res = micro_model.predict(crop, conf=confidence_threshold, verbose=False, device="cpu")[0]
-                    local_boxes = _parse_yolo_boxes(micro_res.boxes, micro_res.names)
-                    for lb in local_boxes:
-                        lx, ly, lw, lh = lb["bbox"]
-                        lb["bbox"] = (lx + x, ly + y, lw, lh)
-                        lb["level"] = "micro"
-                        yolo_results[i].append(lb)
-        
-        del micro_model
-        
-    except Exception as e:
-        logger.warning(f"YOLO CPU failed: {e}. Vision LLM will handle all detection.")
-    
-    for i, dets in enumerate(yolo_results):
-        logger.info(f"YOLO CPU: {states[i].image_path} -> {len(dets)} boxes")
-    
-    return yolo_results
+    """Each optional UI checkpoint covers the full image independently."""
+    results = [[] for _ in states]
+    for level, weights in (("macro",yolo_macro_path),("micro",yolo_micro_path)):
+        try:
+            model = _load_yolo_cpu(weights,export_onnx)
+        except Exception as exc:
+            logger.warning("Skipping %s detector: %s",level,exc)
+            continue
+        try:
+            for index,state in enumerate(states):
+                result = model.predict(state.image_path,conf=confidence_threshold,verbose=False,device="cpu")[0]
+                boxes = _parse_yolo_boxes(result.boxes,result.names)
+                results[index].extend({**box,"level":level} for box in boxes)
+        finally:
+            del model
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Vision LLM 3B Detector (GPU subprocess)
+# Stage 2: Vision LLM 7B Detector (GPU subprocess)
 # ---------------------------------------------------------------------------
 
 
 def _parse_truncated_json(json_str):
-    """Parse a JSON array that may have been truncated by token limit."""
-    try:
-        result = json.loads(json_str)
-        if isinstance(result, list):
-            return result
-        return [result] if isinstance(result, dict) else []
-    except json.JSONDecodeError:
-        pass
-
-    last_complete = -1
-    brace_depth = 0
-    in_string = False
-    escape_next = False
-
-    for i, ch in enumerate(json_str):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == '{':
-            brace_depth += 1
-        elif ch == '}':
-            brace_depth -= 1
-            if brace_depth == 0:
-                last_complete = i
-
-    if last_complete == -1:
-        return []
-
-    repaired = json_str[:last_complete + 1].rstrip().rstrip(',') + ']'
-    if not repaired.startswith('['):
-        repaired = '[' + repaired
-    try:
-        result = json.loads(repaired)
-        return result if isinstance(result, list) else []
-    except json.JSONDecodeError:
-        return []
+    # A partial array is incomplete detection, never a successful extraction.
+    result = json.loads(json_str)
+    if not isinstance(result,list) or not all(isinstance(item,dict) for item in result):
+        raise ValueError("Vision detector must return a complete JSON array")
+    return result
 
 
 def _run_vision_subprocess(worker_module, payload):
@@ -297,30 +189,29 @@ def _run_vision_subprocess(worker_module, payload):
         with open(payload_file, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         
-        completed = subprocess.run(
-            [sys.executable, "-m", worker_module, str(payload_file)],
-            stdout=subprocess.PIPE,
-            stderr=None,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        
+        completed = run_worker([sys.executable, "-m", worker_module, str(payload_file)],
+                               timeout=settings.worker_timeout_sec)
+
         stdout_lines = completed.stdout.splitlines(keepends=True)
         for line in stdout_lines:
             if "__VISION_JSON_START__" not in line and "__VISION_JSON_END__" not in line and line.strip():
-                logger.info(f"[VLM] {line.strip()}")
+                logger.debug(f"[VLM] {line.strip()[:500]}")
         
         if completed.returncode != 0:
-            raise RuntimeError(f"Vision subprocess failed (code {completed.returncode})")
+            raise RuntimeError(f"Vision subprocess failed (code {completed.returncode}): {completed.stderr[-1500:]}")
         
         stdout = completed.stdout
         if "__VISION_JSON_START__" not in stdout or "__VISION_JSON_END__" not in stdout:
             raise RuntimeError("Vision subprocess output missing JSON markers")
         
         json_str = stdout.split("__VISION_JSON_START__")[1].split("__VISION_JSON_END__")[0].strip()
-        return json.loads(json_str)
-        
+        result = json.loads(json_str)
+        if payload.get("image_paths"):
+            from pathlib import Path
+            target = Path(payload["image_paths"][0]).parent / (worker_module.rsplit(".",1)[-1] + "-raw.json")
+            target.write_text(json.dumps(result,indent=2),encoding="utf-8")
+        return result
+
     finally:
         if payload_file.exists():
             try:
@@ -329,35 +220,88 @@ def _run_vision_subprocess(worker_module, payload):
                 pass
 
 
-def _run_vision_detector(states, yolo_detections_per_state):
-    """Run the 3B Vision LLM detector subprocess."""
-    model_name = settings.vision_detector_model_name
-    load_in_4bit = settings.local_llm_load_in_4bit
-    
-    logger.info(f"Vision Detector: running {model_name} on {len(states)} images")
-    
-    # Format YOLO detections for the prompt
-    yolo_for_prompt = []
-    for dets in yolo_detections_per_state:
-        yolo_for_prompt.append([{"bbox": list(d["bbox"]), "confidence": d.get("confidence", 0.5)} for d in dets])
-    
-    payload = {
-        "model_name": model_name,
-        "image_paths": [str(s.image_path) for s in states],
-        "yolo_detections": yolo_for_prompt,
-        "temperature": 0.1,
-        "max_new_tokens": 1024,
-        "load_in_4bit": load_in_4bit,
-    }
-    
-    raw_results = _run_vision_subprocess("app.modules.vision_detector_worker", payload)
-    
-    # Parse each image's result
-    parsed_results = []
-    for res_str in raw_results:
-        parsed_results.append(_parse_truncated_json(res_str))
-    
-    return parsed_results
+def _supported_role(kind, anchor):
+    """Reject unsupported control guesses for OCR-only anchors.
+
+    Trained UI boxes may be unlabeled. Text-only regions need a plausible field
+    or command cue; decorative labels must not become dozens of fake inputs.
+    """
+    import re
+    from difflib import SequenceMatcher
+    if anchor.get("source") != "ocr":
+        return kind
+    text = str(anchor.get("text") or "").strip().casefold()
+    input_cue = bool(re.match(r"^(paste|provide|enter|type|search|email|e-mail|password|username|name|query|message|address|phone)\b",text))
+    if kind == "input" and not input_cue:
+        return "text"
+    if kind in {"checkbox","radio","switch"} and not re.match(r"^(remember|agree|accept|enable|disable|subscribe|select|show|hide|allow|notify|notifications)\b",text):
+        return "text"
+    if kind == "slider":
+        return "text"  # OCR labels cannot establish the track/thumb geometry.
+    if kind == 'dropdown' and not re.match(r'^(select|choose|sort|filter|language|country|category|mode|voice)\b',text):
+        return 'text'  # A noun alone does not establish a selector/arrow control.
+    words = re.findall(r"[a-z]+",text)
+    verbs = {"save","submit","next","back","cancel","close","attach","browse","upload","download",
+             "execute","run","start","stop","continue","sign","log","login","create","delete","remove",
+             "send","search","open","apply","confirm","yes","no","voice","scan","inspect","analyze","analyse","verify","check"}
+    command = bool(words) and (words[0] in verbs or
+        any(abs(len(words[0])-len(verb))<=2 and SequenceMatcher(None,words[0],verb).ratio() >= .70 for verb in verbs if len(verb)>4))
+    if kind in {"button","link","tab"} and not command:
+        return "text"
+    # Obvious placeholder/imperative cues remain usable if a weak model chooses
+    # 'static'. These are explicit heuristics, not verified application semantics.
+    if kind == "text" and re.match(r"^(enter|type)\b",text):
+        return "input"
+    if kind == "text" and command:
+        return "button"
+    return kind
+
+
+def _run_vision_detector(states, yolo_detections_per_state, ocr_detections_per_state=None):
+    """Classify grounded anchors, never ask the small VLM to invent geometry/text."""
+    ocr_detections_per_state = ocr_detections_per_state or [[] for _ in states]
+    anchors_per_state = []
+    for yolo, ocr in zip(yolo_detections_per_state,ocr_detections_per_state):
+        anchors = [{**item,"type":item.get("label","container"),"text":None,"source":"yolo"} for item in yolo]
+        anchors.extend({"bbox":item.get("bbox",item.get("box")),"text":item.get("text"),
+                        "confidence":item.get("confidence",.5),"type":"text","source":"ocr"} for item in ocr)
+        anchors_per_state.append(anchors)
+    if not any(anchors_per_state):
+        return [[] for _ in states]
+    payload = {"model_name":settings.vision_detector_model_name,
+        "image_paths":[str(s.image_path) for s in states],"anchors":anchors_per_state,
+        "temperature":0.0,"max_new_tokens":settings.vision_max_new_tokens,
+        "load_in_4bit":True,"metrics_path":str(Path(states[0].image_path).parent/"gpu_profile.json")}
+    raw = _run_vision_subprocess("app.modules.vision_detector_worker",payload)
+    if len(raw) != len(states):
+        raise ValueError("Semantic classifier state count mismatch")
+    result = []
+    allowed = {"button","input","checkbox","radio","switch","slider","dropdown","link","tab","text","image","icon","container"}
+    for state,anchors,response in zip(states,anchors_per_state,raw):
+        try:
+            labels=json.loads(response)
+            if not isinstance(labels,dict):
+                raise ValueError("Expected anchor ID to semantic type mapping")
+        except (ValueError,TypeError):
+            labels={}
+            logger.warning("Semantic classification incomplete for frame %s",state.frame_index)
+        with Image.open(state.image_path) as source:
+            size=source.size
+        items=[]
+        for index,anchor in enumerate(anchors):
+            kind=labels.get(str(index),anchor["type"])
+            kind=kind if isinstance(kind,str) and kind in allowed else anchor["type"]
+            kind=_supported_role(kind,anchor)
+            item={**anchor,"type":kind,"text_bbox":anchor["bbox"]}
+            if anchor["source"] == "yolo":
+                item["id"]=index
+            if kind in {"button","input","checkbox","radio","switch","slider","dropdown","link","tab"} and anchor["source"] == "ocr":
+                x,y,w,h=map(float,anchor["bbox"])
+                pad=max(3,h*.4)
+                item["bbox"]=(max(0,x-pad),max(0,y-pad),min(size[0],x+w+pad)-max(0,x-pad),min(size[1],y+h+pad)-max(0,y-pad))
+            items.append(item)
+        result.append(items)
+    return result
 
 
 def _apply_verifier_patches(original_dets, verifier_output):
@@ -372,62 +316,18 @@ def _apply_verifier_patches(original_dets, verifier_output):
     for corr in verifier_output.get("corrections", []):
         if isinstance(corr, dict) and "id" in corr and corr["id"] in dets_by_id:
             for k, v in corr.items():
-                if k != "id":
-                    dets_by_id[corr["id"]][k] = v
+                if k == "type" and isinstance(v,str):
+                    dets_by_id[corr["id"]][k] = _supported_role(v,dets_by_id[corr["id"]])
                     
     final_dets = list(dets_by_id.values())
-    for new_el in verifier_output.get("missed_elements", []):
-        if isinstance(new_el, dict) and "bbox" in new_el:
-            bbox = new_el["bbox"]
-            if isinstance(bbox, list) and len(bbox) == 4:
-                final_dets.append({
-                    "bbox": tuple(float(v) for v in bbox),
-                    "type": new_el.get("type", "div"),
-                    "text": new_el.get("text"),
-                    "confidence": new_el.get("confidence", 0.9),
-                    "source": "verifier",
-                })
-            
+    # The semantic checker cannot introduce ungrounded boxes. Missed objects
+    # must come from another measured OCR/UI-detector pass, not free-form JSON.
     return final_dets
 
 
 def _run_vision_verifier(states: list, detections_per_state: list[list[dict]]) -> tuple[list[list[dict]], list[bool]]:
-    """Stage 2: Use Vision LLM 7B to verify and patch the merged detections."""
-    model_name = settings.vision_llm_model_name
-    load_in_4bit = settings.local_llm_load_in_4bit
-    
-    logger.info(f"Vision Verifier: running {model_name} on {len(states)} images")
-    
-    payload = {
-        "model_name": model_name,
-        "image_paths": [str(s.image_path) for s in states],
-        "detections": detections_per_state,
-        "temperature": 0.1,
-        "max_new_tokens": 1024,
-        "load_in_4bit": load_in_4bit,
-    }
-        
-    raw_results = _run_vision_subprocess("app.modules.vision_verifier_worker", payload)
-    
-    verified_results = []
-    approval_flags = []
-    
-    for i, res_str in enumerate(raw_results):
-        original_dets = detections_per_state[i] if i < len(detections_per_state) else []
-        try:
-            parsed = json.loads(res_str) if isinstance(res_str, str) else res_str
-            if isinstance(parsed, dict):
-                approval_flags.append(parsed.get("approved", True))
-                patched = _apply_verifier_patches(original_dets, parsed)
-                verified_results.append(patched)
-            else:
-                approval_flags.append(True)
-                verified_results.append(original_dets)
-        except (json.JSONDecodeError, TypeError):
-            approval_flags.append(True)
-            verified_results.append(original_dets)
-    
-    return verified_results, approval_flags
+    """Compatibility shim: independent verification is structural/browser based."""
+    return detections_per_state, [False for _ in states]
 
 
 # ---------------------------------------------------------------------------
@@ -435,57 +335,58 @@ def _run_vision_verifier(states: list, detections_per_state: list[list[dict]]) -
 # ---------------------------------------------------------------------------
 
 
+def _valid_detection(item, image_size=None):
+    import math
+    if not isinstance(item, dict):
+        return None
+    try:
+        x, y, w, h = map(float, item["bbox"])
+        confidence = float(item.get("confidence", 0.5))
+        if not all(math.isfinite(v) for v in (x, y, w, h, confidence)) or w <= 0 or h <= 0:
+            return None
+        if image_size:
+            iw, ih = image_size
+            right, bottom = min(iw, x+w), min(ih, y+h)
+            x, y = max(0, x), max(0, y)
+            w, h = right-x, bottom-y
+            if w <= 0 or h <= 0:
+                return None
+        label = str(item.get("type", item.get("label", "container"))).strip().lower().replace(" ", "_")
+        return {**item, "bbox": (x,y,w,h), "type": label,
+                "text": item.get("text") if isinstance(item.get("text"), str) else None,
+                "confidence": min(1.0, max(0.0, confidence))}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _merge_detections(yolo_dets, vlm_dets, iou_threshold=0.5):
-    """
-    Merge YOLO detections (precise bboxes) with Vision LLM detections
-    (semantic labels + missed elements). For overlapping boxes (IoU > threshold),
-    keep YOLO's bbox precision but use VLM's semantic type and text.
-    """
     merged = []
-    
-    # Create a map of YOLO detections by ID
-    yolo_by_id = {i: yd for i, yd in enumerate(yolo_dets)}
-    
-    # If VLM failed and didn't return a list, fallback to raw YOLO
-    if not isinstance(vlm_dets, list):
-        vlm_dets = []
-        
-    for vd in vlm_dets:
+    remaining = {i: d for i, d in enumerate(yolo_dets)}
+    for vd in vlm_dets if isinstance(vlm_dets, list) else []:
         if not isinstance(vd, dict):
             continue
-            
-        if "id" in vd and vd["id"] in yolo_by_id:
-            yd = yolo_by_id[vd["id"]]
-            merged.append({
-                "bbox": yd["bbox"],  # keep YOLO's precise bbox
-                "type": vd.get("type", yd.get("label", "div")),  # use VLM's semantic type
-                "text": vd.get("text"),
-                "confidence": max(yd.get("confidence", 0.5), vd.get("confidence", 0.5)),
-                "source": "yolo+vlm",
-            })
-            del yolo_by_id[vd["id"]]
-        elif "bbox" in vd:
-            # Missed element found by VLM
-            bbox = vd["bbox"]
-            if isinstance(bbox, list) and len(bbox) == 4:
-                merged.append({
-                    "bbox": tuple(float(v) for v in bbox),
-                    "type": vd.get("type", "div"),
-                    "text": vd.get("text"),
-                    "confidence": vd.get("confidence", 0.5),
-                    "source": "vlm",
-                })
-    
-    # Any YOLO detections not labeled by VLM are kept with default types
-    for yd in yolo_by_id.values():
-        merged.append({
-            "bbox": yd["bbox"],
-            "type": yd.get("label", "div"),
-            "text": None,
-            "confidence": yd.get("confidence", 0.5),
-            "source": "yolo",
-        })
-        
+        match = vd.get("id")
+        if not isinstance(match, int) or match not in remaining:
+            match = None
+            if "bbox" in vd and _valid_detection(vd):
+                scores = [(i, _iou(d["bbox"], vd["bbox"])) for i,d in remaining.items()]
+                if scores:
+                    candidate, score = max(scores, key=lambda v:v[1])
+                    if score >= iou_threshold:
+                        match = candidate
+        if match is not None:
+            yd = remaining.pop(match)
+            item = {**yd, **vd, "bbox": yd["bbox"], "source": "yolo+vlm"}
+        else:
+            item = {**vd, "source": vd.get("source", "vlm")}
+        normalized = _valid_detection(item)
+        if normalized and not any(_iou(normalized["bbox"], m["bbox"]) > .9 and
+                                 normalized["type"] == m["type"] for m in merged):
+            merged.append(normalized)
+    for yd in remaining.values():
+        normalized = _valid_detection({**yd,"source":"yolo"})
+        if normalized:
+            merged.append(normalized)
     return merged
 
 
@@ -495,76 +396,35 @@ def _merge_detections(yolo_dets, vlm_dets, iou_threshold=0.5):
 
 
 class PersistentOCRWorker:
-    def __init__(self, max_jobs=4):
-        self.process = None
-        self.lock = threading.Lock()
-        self.jobs_processed = 0
-        self.max_jobs = max_jobs
-        
-    def start(self):
-        if self.process is None or self.process.poll() is not None:
-            self.process = subprocess.Popen(
-                [sys.executable, "-m", "app.modules.ocr_subprocess_worker"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1
-            )
-            self.jobs_processed = 0
-            
+    """One bounded subprocess per batch: no leaked framework state between jobs."""
     def analyze(self, image_paths, lang, confidence_threshold):
-        with self.lock:
-            self.jobs_processed += 1
-            if self.jobs_processed > self.max_jobs:
-                self.shutdown()
-            self.start()
-            
-            payload = {
-                "image_paths": image_paths,
-                "lang": lang,
-                "confidence_threshold": confidence_threshold
-            }
-            self.process.stdin.write(json.dumps(payload) + "\n")
-            self.process.stdin.flush()
-            
-            output = ""
-            while True:
-                line = self.process.stdout.readline()
-                if not line:
-                    logger.error("OCR Subprocess died unexpectedly.")
-                    self.process = None
-                    return [[] for _ in image_paths]
-                
-                if "__OCR_PROGRESS__" in line:
-                    prog = line.split("__OCR_PROGRESS__")[1].split("__")[0].strip()
-                    logger.info(f"PaddleOCR progress: {prog} frames...")
-                    continue
+        from app.modules import ocr_cache
+        cached = [ocr_cache.load(path,lang,confidence_threshold) for path in image_paths]
+        missing = [i for i,value in enumerate(cached) if value is None]
+        if not missing:
+            return cached
+        payload = {"image_paths":[image_paths[i] for i in missing],"lang":lang,"confidence_threshold":confidence_threshold}
+        completed = run_worker([sys.executable,"-m","app.modules.ocr_subprocess_worker"],
+            input=json.dumps(payload)+"\n"+json.dumps({"command":"shutdown"})+"\n",
+            timeout=settings.worker_timeout_sec)
 
-                output += line
-                if "__OCR_JSON_END__" in output:
-                    break
-                    
-            try:
-                json_str = output.split("__OCR_JSON_START__")[1].split("__OCR_JSON_END__")[0].strip()
-                result = json.loads(json_str)
-                if result.get("status") == "error":
-                    logger.error(f"OCR Subprocess Error: {result.get('message')}")
-                    return [[] for _ in image_paths]
-                return result.get("detections", [])
-            except Exception as e:
-                logger.error(f"Failed to parse OCR subprocess output: {e}")
-                return [[] for _ in image_paths]
-                
+        try:
+            result = json.loads(completed.stdout.split("__OCR_JSON_START__")[1].split("__OCR_JSON_END__")[0])
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError("OCR worker returned no valid result: " + completed.stderr[-2000:]) from exc
+        if result.get("status") != "success" or completed.returncode:
+            raise RuntimeError("OCR failed: " + str(result.get("message",completed.stderr[-2000:])))
+        detections = result.get("detections")
+        if not isinstance(detections,list) or len(detections) != len(missing):
+            raise RuntimeError("OCR returned a different number of states")
+        for i,detection in zip(missing,detections):
+            cached[i] = detection
+            ocr_cache.save(image_paths[i],lang,confidence_threshold,detection)
+        return cached
+
     def shutdown(self):
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
-                self.process.stdin.flush()
-                self.process.wait(timeout=5)
-            except Exception:
-                self.process.kill()
-            self.process = None
+        pass
+
 
 _global_ocr_worker = PersistentOCRWorker()
 
@@ -596,235 +456,103 @@ def _load_depth_pipeline(model_name, device):
 
 
 def _analyze_states_sync(
-    states: list[KeyStateFrame],
-    yolo_confidence_threshold: Optional[float] = None,
-    ocr_lang: Optional[str] = None,
-    ocr_confidence_threshold: Optional[float] = None,
-    depth_model_name: Optional[str] = None,
-    colors_per_element: Optional[int] = None,
-    cuda_device_index: Optional[int] = None,
-    enable_3d: bool = True,
+    states: list[KeyStateFrame], yolo_confidence_threshold=None, ocr_lang=None,
+    ocr_confidence_threshold=None, depth_model_name=None, colors_per_element=None,
+    cuda_device_index=None, enable_3d=False,
 ) -> tuple[list[list[DetectedElement]], list[bool]]:
+    """Detect, validate and fuse all regions without dropping dense UI content.
+
+    Model failures are persisted as degradation warnings, never approvals.
+    Source assets still allow a useful preview if semantic extraction is partial.
+    Natural-scene depth is intentionally not used as CSS stacking order.
     """
-    Returns (detections_per_state, verifier_approvals_per_state).
-    """
+    from pathlib import Path
+    from app.modules.visual_styles import measure_styles, control_rectangles, snap_control_bbox
     if not states:
         return [], []
-
-    yolo_macro_path = settings.yolo_macro_weights_path
-    yolo_micro_path = settings.yolo_micro_weights_path
-    yolo_export_onnx = settings.yolo_export_onnx
-    yolo_conf = settings.yolo_confidence_threshold if yolo_confidence_threshold is None else yolo_confidence_threshold
-    ocr_lang = ocr_lang or settings.paddleocr_lang
-    ocr_conf = settings.ocr_confidence_threshold if ocr_confidence_threshold is None else ocr_confidence_threshold
-    depth_model_name = depth_model_name or settings.depth_model_name
-    colors_per_element = colors_per_element or settings.colorgram_colors_per_element
-    cuda_device_index = settings.cuda_device_index if cuda_device_index is None else cuda_device_index
-
-    torch_device = f"cuda:{cuda_device_index}" if _cuda_is_available() else "cpu"
-    images = [Image.open(state.image_path).convert("RGB") for state in states]
-    guard = GPUPipelineGuard(device_index=cuda_device_index)
-
-    # -----------------------------------------------------------------------
-    # Stage 1: YOLO on CPU (runs during Vision LLM model loading)
-    # -----------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Stage 1: YOLO CPU detection (parallel with VLM loading)")
-    logger.info("=" * 60)
-    
-    yolo_detections = _run_yolo_cpu(states, yolo_macro_path, yolo_micro_path, yolo_export_onnx, yolo_conf)
-
-    # -----------------------------------------------------------------------
-    # Stage 2: Vision LLM 3B Detector (GPU subprocess)
-    # YOLO results are passed as context to reduce VLM workload
-    # -----------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Stage 2: Vision LLM 3B detector (with YOLO context)")
-    logger.info("=" * 60)
-    
-    with guard.stage(
-        "vision_detector_3b",
-        loader=lambda: "subprocess_ready",
-        unloader=lambda _: None,
-        min_free_mb=1024,
-    ):
-        vlm_detections = _run_vision_detector(states, yolo_detections)
-
-    # Merge YOLO + VLM detections
-    merged_per_state = []
-    for i in range(len(states)):
-        yolo_dets = yolo_detections[i] if i < len(yolo_detections) else []
-        vlm_dets = vlm_detections[i] if i < len(vlm_detections) else []
-        merged = _merge_detections(yolo_dets, vlm_dets)
-        merged_per_state.append(merged)
-        
-        yolo_count = sum(1 for m in merged if m["source"] in ("yolo", "yolo+vlm"))
-        vlm_only = sum(1 for m in merged if m["source"] == "vlm")
-        logger.info(f"Merge: {states[i].image_path} -> {len(merged)} total ({yolo_count} from YOLO, {vlm_only} VLM-only)")
-
-    # -----------------------------------------------------------------------
-    # Stage 3: Vision LLM 7B Verifier (GPU subprocess)
-    # -----------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Stage 3: Vision LLM 7B verifier")
-    logger.info("=" * 60)
-    
-    with guard.stage(
-        "vision_verifier_7b",
-        loader=lambda: "subprocess_ready",
-        unloader=lambda _: None,
-        min_free_mb=1024,
-    ):
-        verified_per_state, approval_flags = _run_vision_verifier(states, merged_per_state)
-    
-    # Use verified results if available, otherwise keep merged
-    final_raw_per_state = []
-    for i in range(len(states)):
-        if verified_per_state[i]:
-            final_raw_per_state.append(verified_per_state[i])
-            logger.info(f"Verifier: {states[i].image_path} -> {len(verified_per_state[i])} verified elements (approved={approval_flags[i]})")
-        else:
-            final_raw_per_state.append(merged_per_state[i])
-            logger.info(f"Verifier: {states[i].image_path} -> using merged ({len(merged_per_state[i])} elements, verifier returned empty)")
-
-    # -----------------------------------------------------------------------
-    # Stage 4: PaddleOCR (CPU subprocess) — precise text
-    # -----------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Stage 4: PaddleOCR text extraction")
-    logger.info("=" * 60)
-    
-    with guard.stage(
-        "paddleocr",
-        loader=lambda: "subprocess_ready",
-        unloader=lambda _: None,
-        min_free_mb=512,
-    ):
-        ocr_detections_list = _global_ocr_worker.analyze(
-            [s.image_path for s in states], ocr_lang, ocr_conf
-        )
-
-    # -----------------------------------------------------------------------
-    # Stage 5: Depth-Anything-V2 (GPU) — always run for z-ordering
-    # -----------------------------------------------------------------------
-    depth_array_list = []
-    raw_depth_stats = []
-    
-    logger.info("=" * 60)
-    logger.info("Stage 5: Depth-Anything-V2")
-    logger.info("=" * 60)
-    
-    if enable_3d:
-        with guard.stage(
-            "depth-anything-v2",
-            loader=lambda: _load_depth_pipeline(depth_model_name, torch_device),
-            unloader=lambda p: p.model.to("cpu"),
-            min_free_mb=1536,
-        ) as depth_pipe:
-            depth_results = depth_pipe(images, batch_size=4)
-            if isinstance(depth_results, dict):
-                depth_results = [depth_results]
-            for res in depth_results:
-                arr = np.array(res["depth"])
-                depth_array_list.append(arr)
-                # Pre-normalization statistics for 3D scene detection
-                raw_range = float(arr.max() - arr.min())
-                raw_var = float(arr.var())
-                raw_depth_stats.append({"range": raw_range, "variance": raw_var})
-    else:
-        depth_array_list = [None for _ in images]
-        raw_depth_stats = [{"range": 0.0, "variance": 0.0} for _ in images]
-
-    # -----------------------------------------------------------------------
-    # Assembly: Combine all sources into DetectedElement objects
-    # -----------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Assembling final detection results")
-    logger.info("=" * 60)
-    
+    diagnostics = {"warnings": [], "states": []}
+    yolo = _run_yolo_cpu(states, settings.yolo_macro_weights_path, settings.yolo_micro_weights_path,
+                         settings.yolo_export_onnx, yolo_confidence_threshold or settings.yolo_confidence_threshold)
+    if not any(yolo):
+        diagnostics["warnings"].append("No compatible UI-trained YOLO detections; using vision/OCR")
+    try:
+        ocr = _global_ocr_worker.analyze([s.image_path for s in states], ocr_lang or settings.paddleocr_lang,
+                                       settings.ocr_confidence_threshold if ocr_confidence_threshold is None else ocr_confidence_threshold)
+    except Exception as exc:
+        diagnostics["warnings"].append(f"OCR unavailable: {exc}")
+        ocr = [[] for _ in states]
+    if len(ocr) != len(states):
+        raise RuntimeError("OCR state count mismatch")
+    try:
+        vlm = _run_vision_detector(states,yolo,ocr)
+        if len(vlm) != len(states):
+            raise RuntimeError("Vision detector state count mismatch")
+    except Exception as exc:
+        diagnostics["warnings"].append(f"Vision classification unavailable: {exc}")
+        vlm = [[] for _ in states]
+    merged_states = []
+    for state, yd, vd, text_items in zip(states, yolo, vlm, ocr):
+        with Image.open(state.image_path) as image:
+            size = image.size
+        merged = [d for item in _merge_detections(yd, vd) if (d := _valid_detection(item,size))]
+        for item in text_items:
+            text = _valid_detection({**item, "bbox":item.get("bbox", item.get("box")), "type":"text","source":"ocr"},size)
+            if not text or not text["text"]:
+                continue
+            matched = False
+            for existing in merged:
+                # Same words elsewhere on screen are not duplicates.
+                if existing.get("text", "") and existing["text"].strip().casefold() == text["text"].strip().casefold():
+                    ax,ay,aw,ah = existing["bbox"]; bx,by,bw,bh = text["bbox"]
+                    overlap = max(0,min(ax+aw,bx+bw)-max(ax,bx))*max(0,min(ay+ah,by+bh)-max(ay,by))
+                    if overlap/(bw*bh) > .7:
+                        if existing["type"] == "text":
+                            existing.update(text)
+                        else:
+                            existing["text"] = text["text"]
+                        matched = True
+                        break
+            if not matched:
+                merged.append(text)
+        merged_states.append(merged)
+    verified, approvals = merged_states, [False]*len(states)
+    diagnostics['recognition_model_count']=1
+    diagnostics['verification']='geometry, native-control and browser checks; no model self-approval'
     all_elements = []
-    for state_idx, (state, image, final_raw, ocr_dets, depth_array) in enumerate(
-        zip(states, images, final_raw_per_state, ocr_detections_list, depth_array_list)
-    ):
-        raw_items = []
-        
-        # Add vision-detected elements
-        for vi, item in enumerate(final_raw):
-            bbox = item.get("bbox", [0, 0, 0, 0])
-            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                raw_items.append({
-                    "kind": "vision",
-                    "bbox": tuple(float(v) for v in bbox),
-                    "label": item.get("type", "div"),
-                    "text": item.get("text"),
-                    "confidence": float(item.get("confidence", 0.5)),
-                })
-        
-        # Add OCR text elements (supplement vision detections)
-        for oi, ocr_item in enumerate(ocr_dets):
-            ocr_bbox = ocr_item.get("box", ocr_item.get("bbox", (0, 0, 0, 0)))
-            if isinstance(ocr_bbox, (list, tuple)) and len(ocr_bbox) == 4:
-                # Check if OCR text already exists in vision detections
-                ocr_text = ocr_item.get("text", "")
-                already_found = any(
-                    ri.get("text") and ocr_text and ocr_text.strip().lower() in ri["text"].strip().lower()
-                    for ri in raw_items
-                )
-                if not already_found and ocr_text:
-                    raw_items.append({
-                        "kind": "ocr",
-                        "bbox": tuple(float(v) for v in ocr_bbox),
-                        "label": "text",
-                        "text": ocr_text,
-                        "confidence": float(ocr_item.get("confidence", 0.5)),
-                    })
-
-        # Cap total elements: vision gets priority, then OCR
-        vision_items = [r for r in raw_items if r["kind"] == "vision"]
-        ocr_items = [r for r in raw_items if r["kind"] == "ocr"]
-        vision_items.sort(key=lambda x: x["confidence"], reverse=True)
-        ocr_items.sort(key=lambda x: x["confidence"], reverse=True)
-        raw_items = vision_items[:30] + ocr_items[:15]
-
-        # Compute z-indices
-        if depth_array is not None:
-            raw_depths = [_sample_depth_region(depth_array, item["bbox"]) for item in raw_items]
-            z_indices = _normalize_z_indices(raw_depths)
-        else:
-            raw_depths = [0.0] * len(raw_items)
-            z_indices = [None for _ in raw_items]
-
-        # Build DetectedElement objects
+    for index, (state, raw) in enumerate(zip(states, verified)):
         elements = []
-        for idx, (item, z) in enumerate(zip(raw_items, z_indices)):
-            x, y, w, h = item["bbox"]
-            crop = image.crop((max(0, int(x)), max(0, int(y)), min(image.width, int(x + w)), min(image.height, int(y + h))))
-            hex_colors = _extract_hex_colors(crop, colors_per_element)
-
-            is_text = item["kind"] == "ocr" or item["label"] == "text"
-            source = "vision_llm" if item["kind"] == "vision" else "ocr"
-            
-            elements.append(
-                DetectedElement(
-                    element_id=f"{item['kind']}-{idx:03d}",
-                    element_type="text" if is_text else item["label"],
-                    bbox=BoundingBox(x=x, y=y, width=max(0, w), height=max(0, h), z_index=round(z, 2) if z is not None else None),
-                    text_content=item.get("text") if is_text or item.get("text") else None,
-                    hex_colors=hex_colors,
-                    confidence=round(item["confidence"], 4),
-                    detection_source=source,
-                    raw_depth_range=raw_depth_stats[state_idx]["range"] if depth_array is not None else None,
-                )
-            )
-
-        logger.info(
-            f"Module B: {state.image_path} -> {len(elements)} elements "
-            f"(vision={sum(1 for e in elements if e.detection_source == 'vision_llm')}, "
-            f"ocr={sum(1 for e in elements if e.detection_source == 'ocr')})"
-        )
+        rejected = 0
+        with Image.open(state.image_path) as original:
+            image = original.convert("RGB")
+        rectangles = control_rectangles(image)
+        for item in raw:
+            item = _valid_detection(item, image.size)
+            if not item:
+                rejected += 1
+                continue
+            if item["type"] in {"button","input","dropdown","select","tab","link"}:
+                item["bbox"] = snap_control_bbox(item["bbox"],rectangles,image.size)
+            source = {"yolo":"yolo","yolo+vlm":"vision_llm","vlm":"vision_llm",
+                      "ocr":"ocr","verifier":"verifier"}.get(item.get("source"),"vision_llm")
+            x,y,w,h = item["bbox"]
+            crop = image.crop((int(x),int(y),int(x+w),int(y+h)))
+            styles=measure_styles(image,item["bbox"],item["text"],item["type"])
+            if item.get("text") and item.get("text_bbox"):
+                styles["font-size"] = f"{max(8,round(float(item['text_bbox'][3])*.8))}px"
+            elements.append(DetectedElement(element_id=f"{source}-{len(elements):04d}",
+                element_type=item["type"], bbox=BoundingBox(x=x,y=y,width=w,height=h),
+                text_content=item["text"], confidence=item["confidence"], detection_source=source,
+                hex_colors=_extract_hex_colors(crop,colors_per_element or settings.colorgram_colors_per_element),
+                styles=styles,attributes={"data-text-bbox":json.dumps(item.get('text_bbox',item['bbox']))}))
         all_elements.append(elements)
-
-    return all_elements, approval_flags
+        diagnostics["states"].append({"frame_index":state.frame_index,"elements":len(elements),
+            "rejected_geometry":rejected,"verifier_approved":approvals[index],
+            "raw_detector":vlm[index],"final_detections":[e.model_dump() for e in elements]})
+    diagnostics_path = Path(states[0].image_path).parent / "detection_diagnostics.json"
+    diagnostics_path.write_text(json.dumps(diagnostics,indent=2),encoding="utf-8")
+    if diagnostics["warnings"]:
+        logger.warning("Detection degraded: %s", diagnostics["warnings"])
+    return all_elements, approvals
 
 
 async def analyze_states(states: list[KeyStateFrame], **kwargs) -> tuple[list[list[DetectedElement]], list[bool]]:

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OmniUI — Local Video-to-Code AI Pipeline</title>
-  <meta name="description" content="100% offline, GPU-accelerated local pipeline converting UI video recordings into exact working React, HTML, CSS, and Three.js code." />
+  <meta name="description" content="Local video reconstruction with preserved artwork, editable React controls and screenshot verification." />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -45,6 +45,7 @@
   </header>
 
   <main class="main-container">
+    <p><a href="/examples/forge-hub/" target="_blank" rel="noopener">Open the rebuilt interactive Forge Hub example</a> — reviewed React components and procedural animation; local demonstration.</p>
     <!-- Section 1: System Health & VRAM Monitor -->
     <section class="metrics-grid">
       <div class="metric-card glass">
@@ -67,10 +68,10 @@
 
       <div class="metric-card glass">
         <div class="metric-header">
-          <span class="metric-label">Local LLM Syntax Compiler</span>
+          <span class="metric-label">Code compiler Syntax Compiler</span>
           <svg class="metric-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>
         </div>
-        <div class="metric-value" id="llmModelDisplay">Local LLM (Checking...)</div>
+        <div class="metric-value" id="llmModelDisplay">Code compiler (Checking...)</div>
         <div class="metric-sub" id="llmTargetDisplay">Model: Loading...</div>
       </div>
     </section>
@@ -107,8 +108,12 @@
       <div class="options-section" style="margin-top: 1.5rem; margin-bottom: 1.5rem; text-align: center; color: var(--text-secondary); display: flex; justify-content: center; gap: 2rem;">
 
         <label style="display: inline-flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.95rem;">
-          <input type="checkbox" id="fastModeToggle" style="accent-color: var(--accent-blue); width: 1.1rem; height: 1.1rem;" />
-          <span>⚡ Fast Mode (Skip LLM Code Gen)</span>
+          <span>Output:</span>
+          <select id="renderModeSelect" aria-label="Output mode">
+            <option value="hybrid">Rebuild controls with isolated artwork and motion</option>
+            <option value="asset-backed">Preserve artwork and rebuild controls</option>
+            <option value="editable">Editable HTML/CSS approximation</option>
+          </select>
         </label>
       </div>
 
@@ -155,7 +160,7 @@
         <div class="step-card" id="stepB">
           <div class="step-num">02</div>
           <div class="step-title">Module B: Spatial Vision</div>
-          <div class="step-desc">YOLOv10 bounding boxes, PaddleOCR typography, and Depth-Anything-V2 3D mapping.</div>
+          <div class="step-desc">UI vision detection, spatial OCR fusion and measured styles.</div>
           <div class="step-status">Waiting</div>
         </div>
 
@@ -169,7 +174,7 @@
         <div class="step-card" id="stepD">
           <div class="step-num">04</div>
           <div class="step-title">Module D: Local Code Gen</div>
-          <div class="step-desc">Local LLM syntax compilation transcribes exact coordinates into React JSX, CSS &amp; Three.js.</div>
+          <div class="step-desc">Compile measured React controls with preserved artwork and recorded motion.</div>
           <div class="step-status">Waiting</div>
         </div>
 
@@ -192,6 +197,8 @@
 
       <!-- Completion Actions -->
       <div class="completion-actions hidden" id="completionActions">
+                        <a class="btn-success" id="previewResultBtn" target="_blank" rel="noopener">Open reconstructed UI</a>
+        <a class="btn-secondary" id="reviewResultBtn" target="_blank" rel="noopener">Review controls and interactions</a>
         <a href="#" class="btn-success" id="downloadZipBtn" download>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
           <span>Download Generated Code Package (.zip)</span>

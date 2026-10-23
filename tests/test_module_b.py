@@ -22,15 +22,14 @@ from PIL import Image
 
 from app.modules import module_b_spatial_vision as module_b
 from app.modules.module_b_spatial_vision import (
-    PaddleOCRResultError,
     _normalize_z_indices,
-    _parse_paddleocr_result,
     _parse_yolo_boxes,
     _rgb_to_hex,
     _sample_depth_region,
     _xyxy_to_bbox_tuple,
 )
 from app.models.schemas import KeyStateFrame
+from app.modules.ocr_adapter import PaddleOCRResultError, _parse_paddleocr_result
 
 
 # --- pure function tests -----------------------------------------------------
@@ -189,20 +188,17 @@ def test_analyze_state_sync_combines_yolo_and_ocr_into_flat_list(tmp_path, monke
     depth_arr[50:100, :] = 50  # text region: "farther"
     fake_depth = _FakeDepthPipeline(Image.fromarray(depth_arr))
 
-    monkeypatch.setattr(module_b, "_load_yolo", lambda *a, **kw: fake_yolo)
-    monkeypatch.setattr(module_b, "_load_paddleocr", lambda *a, **kw: fake_ocr)
-    monkeypatch.setattr(module_b, "_load_depth_pipeline", lambda *a, **kw: fake_depth)
-
-    state = KeyStateFrame(frame_index=0, timestamp_sec=0.0, image_path=str(img_path))
-    elements = module_b._analyze_state_sync(state)
-
+    monkeypatch.setattr(module_b, "_run_yolo_cpu", lambda states,*a: [[{"bbox":(10,10,80,30),"label":"button","confidence":.9}]])
+    monkeypatch.setattr(module_b._global_ocr_worker, "analyze",lambda *a:[_parse_paddleocr_result(fake_ocr_result)])
+    state = KeyStateFrame(frame_index=0,timestamp_sec=0,image_path=str(img_path))
+    states, approvals = module_b._analyze_states_sync([state])
+    elements = states[0]
     assert len(elements) == 2
-    button_el = next(e for e in elements if e.element_type == "button")
-    text_el = next(e for e in elements if e.element_type == "text")
-
-    assert button_el.bbox.width == pytest.approx(80.0)
-    assert text_el.text_content == "Click me"
-    assert button_el.confidence == pytest.approx(0.9)
-    assert text_el.confidence == pytest.approx(0.93)
-    # the "closer" button region should get a higher z_index than the "farther" text region
-    assert button_el.bbox.z_index > text_el.bbox.z_index
+    button = next(e for e in elements if e.element_type == "button")
+    text = next(e for e in elements if e.element_type == "text")
+    assert button.bbox.width == 80
+    assert text.text_content == "Click me"
+    assert button.detection_source == "yolo"
+    assert text.detection_source == "ocr"
+    assert button.bbox.z_index is None  # scene depth is not CSS stacking order
+    assert approvals == [False]

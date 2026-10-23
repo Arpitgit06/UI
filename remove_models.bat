@@ -41,7 +41,6 @@ if exist "%PROJECT_ROOT%yolov*.pt" (
 echo.
 echo ===============================================================================
 echo Models removed successfully.
-echo Next time you start the app, models will either be downloaded on-demand,
-echo or you can run setup.bat to pre-cache them again.
+echo Startup will report missing weights. Run setup.bat to download them again.
 echo ===============================================================================
 exit /b 0
