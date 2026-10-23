@@ -1,217 +1,281 @@
-<div align="center">
-  <h1>✨ OmniUI</h1>
-  <p><b>Local, offline video-to-UI-code pipeline.</b></p>
-</div>
+# OmniUI
 
-<p align="center">
-  Converts a screen recording of a 2D/3D interface into working React/HTML/CSS (and React Three Fiber for 3D) using deterministic computer vision for layout extraction — the local LLM is used strictly as a syntax compiler, never to guess pixel positions.
-</p>
+OmniUI turns screen recordings into local React projects. It combines UI recognition,
+measured layouts, native controls, preserved artwork, and generated visual assets
+with browser verification and a correction workflow.
 
----
+The output is a frontend starting point for another project. OmniUI reconstructs
+visible UI; application services and backend integration belong to the consuming project.
 
-<h2 style="color: #4A90E2;">🎯 Current Status</h2>
+## Features
 
-*(Iteration 6 — hybrid parallel detection pipeline)*
+- Upload MP4, WebM, or MKV recordings through a local dashboard.
+- Detect text and control roles, group elements, and compile measured React/CSS layouts.
+- Export native form controls with browser validation and local interaction hooks.
+- Preserve complex artwork and isolate observed motion where possible.
+- Generate separate artwork candidates with LTX-Video 2B.
+- Review detected elements and confirm navigation between captured screens.
+- Build and inspect output in Chromium, with screenshot comparisons and diagnostic reports.
+- Download a standalone Vite/React project with source, assets, and design metadata.
 
-| Module/Component | Status |
-|---|---|
-| **Core Orchestration** (FastAPI, async job queue) | ✅ Implemented |
-| **VRAM Lifecycle Manager** (`vram_scope`, `GPUPipelineGuard`) | ✅ Implemented |
-| **Module A** — Temporal Video Parser (OpenCV + SSIM + ambient motion) | ✅ Implemented |
-| **Module B** — Hybrid Parallel Detection (YOLO CPU ∥ Vision LLM 3B + 7B verifier + PaddleOCR + Depth) | ✅ Implemented |
-| **Module C** — DOM Synthesizer (auto 3D detection) | ✅ Implemented |
-| **Module D** — Code Generation (runnable Vite+React scaffold) | ✅ Implemented |
+## Requirements
 
----
+| Requirement | Local setup |
+| --- | --- |
+| Operating system | Windows; the automated installer uses Windows batch scripts |
+| Python | Python 3.11 recommended; installer requires 3.10 or newer |
+| Node.js | Node.js 20+ with npm available on `PATH` |
+| GPU | NVIDIA CUDA GPU; the bounded local profile targets 8 GB VRAM |
+| Memory and disk | Allow for large model downloads, Python packages, and intermediate video assets |
+| Network | Required during installation and model caching |
 
-<h2 style="color: #F5A623;">🔄 Workflow Architecture</h2>
+Models run in separate sequential processes to limit concurrent GPU memory use.
+Memory requirements increase with input complexity, token counts, and generation
+settings. The 8 GB profile does not establish that every resolution or video will fit.
 
-When you hit "Start", the pipeline orchestrates a complete upload → queue → parse → detect → verify → nest → generate → download process:
+## Installation
 
-```mermaid
-flowchart TD
-    Start([🚀 Hit Start / Upload .mp4]) --> Queue(Job Queue)
-    
-    subgraph Pipeline [Hybrid Parallel Detection Pipeline]
-        Queue --> ModA[Module A: Temporal Parser<br><i>Extracts Key States</i>]
-        ModA --> ModB[Module B: Spatial Vision]
-        
-        subgraph ModB_Detail [Parallel Analysis]
-            ModB --> YOLO[YOLO CPU<br>Macro/Micro]
-            ModB --> Depth[Depth-Anything-V2 GPU<br>Z-Index]
-            ModB --> OCR[PaddleOCR Worker<br>Text]
-            ModB --> Color[Colorgram CPU<br>Hex Codes]
-        end
-        
-        ModB_Detail --> ModC[Module C: DOM Synthesizer<br><i>Builds DOM Tree</i>]
-        ModC --> ModD[Module D: Code Generator]
-        
-        subgraph ModD_Detail [LLM Generation]
-            ModD --> Prompt[Resolve Values<br>Positions, Colors, 3D]
-            Prompt --> LLM[Local LLM GPU Worker<br>Syntax Transcription]
-            LLM --> Verify{Validator}
-            Verify -- Fail --> LLM
-            Verify -- Pass --> Assemble[Assemble JSX/CSS/R3F]
-        end
-    end
-    
-    Assemble --> Zip[Generate Downloadable .zip]
-    Zip --> Done([✅ Ready for Download])
-    
-    classDef blue fill:#e3f2fd,stroke:#1e88e5,stroke-width:2px,color:#000
-    classDef orange fill:#fff3e0,stroke:#fb8c00,stroke-width:2px,color:#000
-    classDef green fill:#e8f5e9,stroke:#43a047,stroke-width:2px,color:#000
-    classDef purple fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#000
-    
-    class ModA blue
-    class ModB,ModB_Detail orange
-    class ModC green
-    class ModD,ModD_Detail purple
+From the repository root in PowerShell:
+
+```powershell
+.\setup.bat
 ```
 
----
+The installer creates `.venv`, installs the tested Python dependencies, configures
+`.env`, caches the vision/coder models and LTX components, and installs frontend
+verification dependencies and Chromium. Model and browser downloads live in
+`models_cache/`. Existing cached files are reused.
 
-<h2 style="color: #9013FE;">🧩 Modules in Detail</h2>
+Setup sets the model choices in `.env` and preserves unrelated settings.
+Preview the installation commands without downloading anything:
 
-<details>
-<summary><b>Module A: Temporal Parser</b> (Click to expand)</summary>
-
-`app/modules/module_a_temporal_parser.py` reduces a recording to "key state" PNGs plus a best-effort cursor/action guess, using two SSIM comparisons per frame:
-
-1. **Change-from-reference**: Is this frame different enough from the *last captured key state* to be a new one? Comparing against a persistent reference catches slow, gradual transitions (a fading modal, a slow drag).
-2. **Stability-from-previous**: Has the video *stopped changing* frame-to-frame right now? Only once motion settles do we test the settled frame against the reference.
-
-*Both checks run on a downscaled **color** SSIM proxy (not grayscale) so color-only UI changes aren't missed. Cursor position/action is a classical frame-differencing centroid over full-resolution grayscale frames.*
-</details>
-
-<details>
-<summary><b>Module B: Spatial Vision</b> (Click to expand)</summary>
-
-`app/modules/module_b_spatial_vision.py` runs four analyses per key-state image, one heavy model at a time via `GPUPipelineGuard`:
-
-1. **Hybrid YOLO** (`ultralytics`): Macro-detector for containers, Micro-detector for elements inside crops.
-2. **PaddleOCR**: Text region bounding boxes + recognized strings (via persistent subprocess).
-3. **Depth-Anything-V2** (`transformers` pipeline): Per-pixel relative depth → `z_index`.
-4. **Colorgram.py** (CPU): Dominant hex colors per element, from its crop.
-
-*The VRAM gate spans two frameworks, not one. PaddleOCR is fully isolated into a persistent subprocess worker (`app.modules.ocr_subprocess_worker`), ensuring 100% VRAM cleanup.*
-</details>
-
-<details>
-<summary><b>Module C: DOM Synthesizer</b> (Click to expand)</summary>
-
-`app/modules/module_c_dom_synthesizer.py` takes Module B's flat list of `DetectedElement` and builds a parent-child `DOMNode` tree by spatial containment, then writes `state_N_layout.json` — the exact contract Module D consumes.
-
-- **Containment uses an overlap ratio**: `intersection_area(A, B) / area(A) >= dom_containment_threshold` (default 0.8).
-- **Tightest parent**: Each element's parent is the *tightest* enclosing element, requiring a parent candidate to have strictly greater area than the child. This makes the algorithm cycle-proof by construction.
-- **Z-Order sorting**: Within a parent, children are sorted by `z_index` ascending (farthest first, nearest last).
-</details>
-
-<details>
-<summary><b>Module D: Code Generator</b> (Click to expand)</summary>
-
-`app/modules/module_d_code_generator.py` turns Module C's layout tree into React components, CSS, and (for 3D-flagged states) a React Three Fiber scene, using a local LLM running in an isolated subprocess.
-
-- **Python resolves every value; the LLM only transcribes syntax**: Before any prompt is built, Python computes position/size, 3D projection, and color. The LLM's job is to transcribe this already-resolved tree into syntactically correct JSX/CSS/R3F.
-- **Strict Verification**: Every generation is mechanically re-checked. `_validate_component` / `_validate_scene3d` confirm every node's class name appears, CSS blocks contain computed properties, and text content appears verbatim. A failed check retries automatically.
-- **Isolated Generation**: By isolating generation into `llm_subprocess_worker.py`, the OS forcibly reclaims all VRAM the instant generation completes.
-- **Per-state output**: Each key state gets its own component file (`State0.jsx`, `State1.jsx`, ...).
-</details>
-
----
-
-<h2 style="color: #7ED321;">🛠️ Setup & Installation</h2>
-
-```bash
-# 1. Create and activate virtual environment
-python -m venv omniui_env
-source omniui_env/bin/activate      # Windows: omniui_env\Scripts\activate
-
-# 2. Install torch and paddlepaddle-gpu (CUDA-specific wheels) BEFORE requirements.txt:
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-
-# 3. Install remaining requirements
-pip install -r requirements.txt
-pip install -r requirements-dev.txt   # only needed to run tests
-
-# 4. Copy environment variables template
-cp .env.example .env   # adjust if needed
+```powershell
+.\setup.bat --plan
 ```
 
-**Automated Setup**
-```bash
-setup.bat
+Verify that the port, dependencies, model files, and browser are available:
+
+```powershell
+.\start.bat --check
 ```
-> *This automatically sets up your `models_cache` and fully downloads all AI weights (including the 15GB Qwen2.5-Coder model) so the tool works 100% offline forever.*
 
----
+## Running the application
 
-<h2 style="color: #50E3C2;">▶️ Run & Try It</h2>
-
-**Start the Server:**
-```bash
-./run.sh
-# equivalent to: uvicorn app.main:app --reload
+```powershell
+.\start.bat
 ```
-Interactive API docs: http://localhost:8000/docs (the easiest way to POST a video right now).
 
-**Process a Video:**
-```bash
-# 1. Upload
-curl -F "video=@your_ui_recording.mp4" http://localhost:8000/jobs
+Open the dashboard at <http://127.0.0.1:8000/>. API documentation is available at
+<http://127.0.0.1:8000/docs>.
 
-# 2. Check Status
-curl http://localhost:8000/jobs/<job_id>
+1. Upload a recording of the interface.
+2. Wait for analysis, code generation, and browser verification.
+3. Open the reconstructed UI and inspect the review notes.
+4. Use the review editor to correct roles, text, bounds, styling, or navigation.
+5. Build a reviewed revision or download the generated project.
 
-# 3. Download Result
-curl -OJ http://localhost:8000/jobs/<job_id>/download
+A completed pipeline run may still produce a draft requiring review. Check
+`reconstruction_status` and the acceptance report before relying on the result.
+
+If port 8000 is occupied or reserved by Windows, select another port:
+
+```powershell
+.\start.bat --port 8001
 ```
-*With the models fully cached locally by `setup.bat`, the downloaded zip contains generated `State*.jsx` files, `styles.css`, `index.jsx`, and `package.json`.*
 
----
+An existing OmniUI service on the requested port is reused. Automatic reload is
+disabled by default; `--reload` enables development reload. Stop the server with
+`Ctrl+C`. `run.sh` uses the same launcher with a separately prepared Unix virtual
+environment; it is not a Linux dependency installer.
 
-<h2 style="color: #D0021B;">🧪 Testing & Load Testing</h2>
+## Architecture and models
 
-**Run All Tests (Unit, Integration, and System Stress):**
-```bash
-python run_all_tests.py
+| Stage | Implementation | Role |
+| --- | --- | --- |
+| Video analysis | OpenCV and temporal sampling | Select stable UI states across the recording |
+| Text and region extraction | CPU PaddleOCR; optional UI-trained YOLO checkpoints | Recover text and grounded element bounds |
+| UI recognition | `Qwen/Qwen2-VL-7B-Instruct`, NF4 | Classify grounded UI regions |
+| Layout synthesis | Contextual control recovery and measured layout compiler | Build semantic trees, groups, and style data |
+| Artwork encoding | T5, INT8 | Encode the artwork prompt in a separate GPU process |
+| Artwork generation | Original LTX-Video 2B v0.9, FP16 by default | Generate an image-conditioned visual candidate |
+| Code generation | `Qwen/Qwen2.5-Coder-7B-Instruct`, NF4; measured React compiler | Generate shared native panel/form JSX and compile measured scene JSX/CSS |
+| Verification | esbuild, Playwright/Chromium, structural and screenshot checks | Check builds, native editing, layout, and reconstruction acceptance |
+
+The GPU order is recognition, prompt encoding, artwork generation, then code
+generation. Each worker exits before the next model stage begins. Jobs are queued
+sequentially. Inference uses cached models with offline mode enabled by default.
+
+LTX generates artwork, while React renders text and controls. Generated artwork
+is packaged as a separate candidate requiring visual review; normal previews keep
+source-aligned artwork. LTX-Video 2B v0.9 is a distinct model family from LTX-2.3/2.5.
+
+YOLO is optional and requires compatible UI-trained checkpoints. Generic COCO
+checkpoints are excluded from UI detection.
+
+## Generated projects
+
+Each export contains React components, styles, a Vite project, extracted assets,
+and design/verification metadata. Important artifacts include:
+
+| Artifact | Purpose |
+| --- | --- |
+| `design/` | Measured element trees, roles, text, and bounds |
+| `interaction_map.json` | Confirmed navigation between captured states |
+| `motion_manifest.json` | Isolated artwork motion and sampling information |
+| `generated_artwork.json` | LTX candidate metadata and generation profiles |
+| `code_generation.json` | Coder stage provenance |
+| `verification_report.json` | Build, visual, semantic, and acceptance results |
+
+Local results are stored in `storage/jobs/<job_id>/generated/`. Downloadable
+archives are stored in `storage/outputs/`.
+
+After extracting an export, run these commands inside its folder:
+
+```powershell
+npm install
+npm run dev
+# Production build:
+npm run build
 ```
-This script acts as a central test runner. It executes over 50 unit/integration tests that run without any GPU or external service (using hand-built stubs), plus our newly added **System Stress Tests**. The system tests evaluate concurrent job queueing stability and verify that the orchestration layer safely handles heavy VRAM load sequentially without deadlocks.
 
-**Interactive Load & Stress Tester:**
-If you want to manually hammer the API to test its absolute limits, we include a gorgeous interactive CLI tester powered by `rich` and `httpx`.
-```bash
-# First, ensure the OmniUI server is running:
-./run.sh  # (or start.bat)
+The default preview opens the recovered application screen. Diagnostic state
+selection and rendering controls are available with `?inspect=1`. Inspector modes
+include hybrid native UI with isolated artwork, source imagery with control
+overlays, and an editable approximation. Their fidelity and editability differ.
 
-# Then, in a separate terminal:
-python -m tests.run_load_test --jobs 10 --complexity high
+Forms use native browser validation and emit a bubbling `omniui:submit` event
+with field values for integration. They do not call application services. Navigation
+between recovered screens requires confirmed mappings in `interaction_map.json`.
+
+## Configuration
+
+See [`.env.example`](.env.example) for the configuration template.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `OMNIUI_OFFLINE` | `true` | Use cached recognition weights during inference |
+| `OMNIUI_CUDA_DEVICE` | `0` | Select the CUDA device |
+| `OMNIUI_CODE_GENERATOR` | `qwen` | Use the coder; `deterministic` skips it for diagnostics |
+| `OMNIUI_ARTWORK_GENERATOR` | `ltx-2b-fp16` | Select FP16 artwork generation, `ltx-2b-q8`, or `preserve` |
+| `OMNIUI_MAX_UPLOAD_MB` | `512` | Maximum upload size |
+| `OMNIUI_MAX_VIDEO_SECONDS` | `600` | Maximum video duration |
+| `OMNIUI_MAX_KEY_STATES` | `12` | Selected UI state budget |
+| `OMNIUI_MOTION_MAX_SAMPLES` | `80` | Isolated-motion sampling budget |
+| `OMNIUI_MOTION_MAX_REGIONS` | `4` | Maximum isolated motion regions |
+| `OMNIUI_WORKER_TIMEOUT_SEC` | `600` | Inference and browser verification timeout |
+| `OMNIUI_REQUIRE_VISUAL_VERIFICATION` | `true` | Require available browser verification for completion |
+
+To use Q8 artwork, download its matching weights first:
+
+```powershell
+.\.venv\Scripts\python.exe tools/setup_ltx.py --precision q8
 ```
-- `--jobs`: The number of concurrent video uploads to fire at the server simultaneously.
-- `--complexity`: `low` sends simple videos; `high` generates and sends dense, rapidly changing synthetic UI videos specifically designed to push YOLO, Depth-Anything, OCR, and the local LLM pipeline to their maximum limits.
 
----
+Then set `OMNIUI_ARTWORK_GENERATOR=ltx-2b-q8` in `.env`. Set it to `preserve` to
+retain source artwork without running LTX. Restart the service after configuration changes.
 
-<h2 style="color: #8B572A;">⚙️ Design Notes</h2>
+## API
 
-- **Single-worker async queue**: Jobs run strictly one at a time because Module B/D's models can't safely share VRAM with a second job's models loaded concurrently.
-- **`vram_scope()` / `GPUPipelineGuard`**: Guarantees the model is unloaded and `torch.cuda.empty_cache()` + `gc.collect()` run even if inference raises. 
-- **Subprocess Isolation**: The LLM runs via `llm_subprocess_worker.py` ensuring 100% VRAM cleanup between generation stages.
-- **Blocking Calls wrapped**: CPU-bound/GPU-bound stub functions are already dispatched through `asyncio.to_thread`.
-- **Strongly-typed module contracts**: `KeyStateFrame` → `DetectedElement` → `LayoutState` flow between Modules A→B→C→D.
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /jobs` | Upload a recording and queue reconstruction |
+| `GET /jobs/{job_id}` | Read progress, warnings, and reconstruction status |
+| `GET /jobs/{job_id}/preview/` | Open a completed generated preview |
+| `GET /jobs/{job_id}/download` | Download the exported project |
+| `GET /jobs/{job_id}/review/ui` | Open the correction editor |
+| `GET /jobs/{job_id}/review` | Read review data |
+| `POST /jobs/{job_id}/review` | Build a corrected revision |
+| `GET /health` | Inspect service, queue, and GPU status |
 
----
+`POST /jobs` accepts multipart `video` and `render_mode` fields. Render modes are
+`hybrid` (default), `asset-backed`, and `editable`. Refer to `/docs` for schemas.
+The service binds to localhost by default.
 
-<h2 style="color: #4A4A4A;">🗺️ Roadmap</h2>
+## Development and validation
 
-- [x] Module A — OpenCV capture + SSIM frame diffing + cursor tracking
-- [x] Module B — YOLOv10 / PaddleOCR / Colorgram / Depth-Anything-V2 behind `GPUPipelineGuard`
-- [x] Module C — containment-based DOM nesting algorithm
-- [x] Module D — Local LLM subprocess + React/R3F code emission
+Run the test suite after setup:
 
-**Remaining work (tuning and hardening):**
-- A UI-fine-tuned YOLO checkpoint (e.g. trained on Rico) to replace the stock COCO weights.
-- Module C's `is_3d_scene` detection needs Module B to pass through a pre-normalization depth statistic.
-- TensorRT export for YOLOv10 + Depth-Anything-V2.
-- Real end-to-end validation against actual model weights.
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/ -q
+```
+
+Unit and API tests isolate storage and stub model inference. Windows cleanup tests
+use disposable project copies. GPU generation and visual accuracy require separate
+integration checks:
+
+```powershell
+# Build and browser-check a synthetic UI without loading models:
+.\.venv\Scripts\python.exe tools/smoke_renderer.py
+
+# Exercise the sequential vision, LTX, and coder stack with a reference image:
+.\.venv\Scripts\python.exe tools/smoke_ltx.py "path\to\reference.png" --precision fp16
+
+# Reconstruct a complete recording without starting the dashboard server:
+.\.venv\Scripts\python.exe tools/regenerate.py "path\to\recording.mp4" --max-states 6
+```
+
+Run model integration commands while the server is stopped to avoid competing
+GPU workloads. The authored [Forge Hub example](examples/forge-hub/README.md)
+demonstrates component and animation techniques; it is not an automatic pipeline benchmark.
+
+## Project structure
+
+```text
+app/                 API, job queue, inference workers, reconstruction, and verification
+static/              Upload dashboard and review editor
+examples/            Authored reference interfaces
+models_cache/        Downloaded model and browser files (ignored by Git)
+storage/             Uploads, jobs, reports, and exports (ignored by Git)
+tests/               Unit, API, regression, and cleanup tests
+tools/               Setup, launch, cleanup, evaluation, and browser tooling
+setup.bat            Install dependencies and cache models
+start.bat            Check and launch the local service
+clean.bat            Reset project-local generated data and dependencies
+```
+
+## Cleanup and fresh setup
+
+Stop the server and project workers before cleanup. Preview the deletion list:
+
+```powershell
+.\clean.bat --dry-run
+```
+
+Run cleanup and type `yes` when prompted:
+
+```powershell
+.\clean.bat
+```
+
+Cleanup permanently removes project-local model/browser downloads, virtual
+environments, frontend dependencies, all storage contents, generated builds, caches,
+and `.env`. Source code, example source/assets, lockfiles, `.env.example`, and Git
+history are preserved. Shared user/system caches are not removed. `--yes` skips
+the confirmation prompt.
+
+Reinstall and start:
+
+```powershell
+.\setup.bat
+.\start.bat
+```
+
+## Limitations
+
+- Recognition, OCR, grouping, typography, and responsive behavior are estimates;
+  some recordings require manual correction.
+- Complex artwork may remain raster assets. Editable 3D meshes and original
+  animation code are not recovered from video.
+- Source-frame similarity and successful builds alone do not establish native UI
+  reconstruction. Image-only output cannot pass reconstruction acceptance.
+- LTX may alter visual details; generated candidates need independent review.
+- Long clips, scene changes, scrolling, and sampling budgets can limit motion fidelity.
+- Hidden application logic, authentication, native OS integration, and backend
+  contracts cannot be inferred reliably from a screen recording.
+- The exported target is a browser-based React frontend. Other application targets
+  require their own integration and packaging.
+
+## License
+
+Project source is available under the [MIT License](LICENSE). Model weights and
+third-party dependencies remain subject to their respective licenses.
